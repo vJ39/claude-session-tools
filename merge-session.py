@@ -4,10 +4,12 @@ Claude Code セッションマージツール
 セッションBの会話をセッションAに取り込む
 
 使い方:
-  python3 merge-session.py <session_a_jsonl> <session_b_jsonl>
-  python3 merge-session.py <session_a_jsonl> <session_b_jsonl> --dry-run
+  python3 merge-session.py <session_a_jsonl> <session_b_jsonl> [--append] [--dry-run]
 
-セッションBのuser/assistantメッセージをセッションAの先頭に挿入する。
+セッションBのuser/assistantメッセージをセッションAに挿入する。
+  デフォルト: Aの先頭（最初のuserメッセージの前）に挿入
+  --append:   Aの末尾に追加
+
 その後 claude --resume <session_a_id> して /compact すれば圧縮される。
 """
 
@@ -68,7 +70,15 @@ def rewrite_messages(messages, session_id, parent_uuid):
     return rewritten, prev_uuid
 
 
-def merge(session_a_path, session_b_path, dry_run=False):
+def find_last_message_uuid(entries):
+    """セッションの最後のuser/assistantメッセージのuuidを返す"""
+    for e in reversed(entries):
+        if e.get("type") in ("user", "assistant"):
+            return e.get("uuid")
+    return None
+
+
+def merge(session_a_path, session_b_path, dry_run=False, append=False):
     a_entries = load_jsonl(session_a_path)
     b_entries = load_jsonl(session_b_path)
 
@@ -89,40 +99,46 @@ def merge(session_a_path, session_b_path, dry_run=False):
         print("エラー: セッションBに会話メッセージがない")
         sys.exit(1)
 
-    # セッションAの最初のuserメッセージを見つける
-    first_user_idx = find_first_user_index(a_entries)
-    if first_user_idx == 0:
-        print("エラー: セッションAにヘッダーがない")
-        sys.exit(1)
+    mode = "末尾に追加" if append else "先頭に挿入"
 
-    # セッションAの最初のuserメッセージのparentUuidを取得
-    first_user = a_entries[first_user_idx]
-    original_parent = first_user.get("parentUuid")
+    if append:
+        # 末尾追加モード: Aの最後のメッセージの後にBを繋ぐ
+        last_uuid = find_last_message_uuid(a_entries)
+        if not last_uuid:
+            print("エラー: セッションAにメッセージがない")
+            sys.exit(1)
 
-    # セッションBのメッセージを書き換え
-    rewritten_b, last_b_uuid = rewrite_messages(
-        b_conversation, session_id, original_parent
-    )
+        rewritten_b, _ = rewrite_messages(b_conversation, session_id, last_uuid)
+        merged = a_entries + rewritten_b
+    else:
+        # 先頭挿入モード（従来の動作）
+        first_user_idx = find_first_user_index(a_entries)
+        if first_user_idx == 0:
+            print("エラー: セッションAにヘッダーがない")
+            sys.exit(1)
 
-    # セッションAの最初のuserメッセージのparentUuidを、Bの最後のメッセージに繋ぐ
-    a_entries[first_user_idx] = dict(a_entries[first_user_idx])
-    a_entries[first_user_idx]["parentUuid"] = last_b_uuid
+        first_user = a_entries[first_user_idx]
+        original_parent = first_user.get("parentUuid")
 
-    # 組み立て: ヘッダー + B会話 + A全体
-    header = a_entries[:first_user_idx]
-    body = a_entries[first_user_idx:]
-    merged = header + rewritten_b + body
+        rewritten_b, last_b_uuid = rewrite_messages(
+            b_conversation, session_id, original_parent
+        )
+
+        a_entries[first_user_idx] = dict(a_entries[first_user_idx])
+        a_entries[first_user_idx]["parentUuid"] = last_b_uuid
+
+        header = a_entries[:first_user_idx]
+        body = a_entries[first_user_idx:]
+        merged = header + rewritten_b + body
 
     if dry_run:
+        print(f"モード: {mode}")
         print(f"セッションA: {session_a_path}")
         print(f"  メッセージ数: {len(a_entries)}")
         print(f"  sessionId: {session_id}")
         print(f"セッションB: {session_b_path}")
         print(f"  会話メッセージ数: {len(b_conversation)}")
         print(f"マージ後: {len(merged)} エントリ")
-        print(f"  ヘッダー: {len(header)}")
-        print(f"  B会話挿入: {len(rewritten_b)}")
-        print(f"  A本体: {len(body)}")
         print()
         print("--- セッションBの会話プレビュー ---")
         for msg in b_conversation[:10]:
@@ -151,18 +167,19 @@ def merge(session_a_path, session_b_path, dry_run=False):
             for entry in merged:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
-        print(f"マージ完了: {len(rewritten_b)} メッセージをセッションAに挿入")
+        print(f"マージ完了: {len(rewritten_b)} メッセージを{mode}")
         print(f"次のステップ: claude --resume {session_id} して /compact")
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print("使い方: python3 merge-session.py <session_a.jsonl> <session_b.jsonl> [--dry-run]")
+        print("使い方: python3 merge-session.py <session_a.jsonl> <session_b.jsonl> [--append] [--dry-run]")
         sys.exit(1)
 
     a_path = sys.argv[1]
     b_path = sys.argv[2]
     dry_run = "--dry-run" in sys.argv
+    append = "--append" in sys.argv
 
     if not Path(a_path).exists():
         print(f"エラー: {a_path} が見つからない")
@@ -171,4 +188,4 @@ if __name__ == "__main__":
         print(f"エラー: {b_path} が見つからない")
         sys.exit(1)
 
-    merge(a_path, b_path, dry_run)
+    merge(a_path, b_path, dry_run, append)
