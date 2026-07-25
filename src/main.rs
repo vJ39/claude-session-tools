@@ -33,17 +33,24 @@ fn main() -> ExitCode {
 }
 
 /// TUI セッションブラウザ。
+///
+/// resume で開いたセッションを抜けたら一覧へ戻る (機能10)。
+/// 一覧側で終了 (Esc / ^c) を選ぶまでループする。resume 後は毎回走査し直すので、
+/// 直前に触ったセッションのタイトルや更新時刻が最新の状態で一覧に反映される。
 fn run_browser(options: ScanOptions) -> anyhow::Result<ExitCode> {
     let paths = Paths::from_env()?;
-    match tui::run(&paths, options)? {
-        PostAction::None => Ok(ExitCode::SUCCESS),
-        PostAction::Resume(spec) => {
-            // TUI は畳んだ後。ここで claude をそのまま起動する
-            let status = spec.to_command().status()?;
-            Ok(match status.code() {
-                Some(0) | None => ExitCode::SUCCESS,
-                Some(c) => ExitCode::from(c.clamp(0, 255) as u8),
-            })
+    loop {
+        match tui::run(&paths, options)? {
+            PostAction::None => return Ok(ExitCode::SUCCESS),
+            PostAction::Resume(spec) => {
+                // TUI は畳んだ後。ここで claude をそのまま起動する
+                let status = spec.to_command().status()?;
+                // claude が異常終了したときだけ理由を見せて一覧へ戻る。
+                // 正常終了 (/exit や Ctrl-D) はそのまま一覧へ。
+                if !matches!(status.code(), Some(0) | None) {
+                    eprintln!("claude が終了コード {} で終わった", status.code().unwrap());
+                }
+            }
         }
     }
 }

@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OptionalExtension, params};
@@ -22,6 +23,9 @@ pub struct CachedSession {
     pub title_kind: TitleKind,
     pub first_prompt: Option<String>,
     pub line_count: i64,
+    /// jsonl 内 timestamp (機能3)。Unix ミリ秒で永続化する。無ければ `None`
+    /// (birthtime へのフォールバックは呼び出し側 [`CachedSession::resolved_created`] が行う)
+    pub jsonl_timestamp_ms: Option<i64>,
 }
 
 impl CachedSession {
@@ -37,8 +41,30 @@ impl CachedSession {
             title_kind: kind,
             first_prompt: meta.first_prompt.clone(),
             line_count: meta.line_count as i64,
+            jsonl_timestamp_ms: meta.timestamp.and_then(system_time_to_millis),
         }
     }
+
+    /// 作成日時として表示する値。jsonl 内 timestamp を優先し、無ければ
+    /// (壊れたファイル等) `birthtime_fallback` (ファイルの birthtime) を使う。
+    pub fn resolved_created(&self, birthtime_fallback: Option<SystemTime>) -> Option<SystemTime> {
+        self.jsonl_timestamp_ms
+            .and_then(millis_to_system_time)
+            .or(birthtime_fallback)
+    }
+}
+
+/// `SystemTime` → Unix ミリ秒 (SQLite の INTEGER 列に持たせるため)。
+/// UNIX_EPOCH より前 (壊れた値) は捨てる。
+fn system_time_to_millis(t: SystemTime) -> Option<i64> {
+    t.duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|d| i64::try_from(d.as_millis()).ok())
+}
+
+/// Unix ミリ秒 → `SystemTime`。負の値 (壊れた値) は捨てる。
+fn millis_to_system_time(ms: i64) -> Option<SystemTime> {
+    u64::try_from(ms).ok().map(|ms| SystemTime::UNIX_EPOCH + Duration::from_millis(ms))
 }
 
 /// ストア。
@@ -89,13 +115,36 @@ impl Store {
                 PRIMARY KEY (session_id, tag)
              );",
         )?;
+        self.migrate_jsonl_timestamp_column()?;
+        Ok(())
+    }
+
+    /// `jsonl_timestamp_ms` 列の追加 (機能3: 作成日時を jsonl 内 timestamp ベースに変更)。
+    ///
+    /// 既存の cst.db にはこの列が無いので `ALTER TABLE` で追加する。追加したということは
+    /// 過去のキャッシュ行はこの列を持たずに書かれたものなので、mtime/size が変わっていない
+    /// 限り再走査されず古い作成日時 (birthtime) のままになってしまう。それでは移行事故で
+    /// birthtime がずれた実データ (旧Mac→新Mac移行時の一括コピー) が直らないため、
+    /// 列を新設したこのタイミングで一度だけ全件のキャッシュを破棄し、次回起動時に
+    /// 再走査させる。
+    fn migrate_jsonl_timestamp_column(&self) -> Result<()> {
+        let has_column = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(session_cache)")?;
+            let mut rows = stmt.query_map([], |r| r.get::<_, String>(1))?;
+            rows.any(|c| c.map(|c| c == "jsonl_timestamp_ms").unwrap_or(false))
+        };
+        if !has_column {
+            self.conn
+                .execute("ALTER TABLE session_cache ADD COLUMN jsonl_timestamp_ms INTEGER", [])?;
+            self.conn.execute("DELETE FROM session_cache", [])?;
+        }
         Ok(())
     }
 
     /// キャッシュを全件読む (path をキーに)。
     pub fn load_cache(&self) -> Result<HashMap<String, CachedSession>> {
         let mut stmt = self.conn.prepare(
-            "SELECT path, mtime_ns, size, session_id, cwd, title, title_kind, first_prompt, line_count
+            "SELECT path, mtime_ns, size, session_id, cwd, title, title_kind, first_prompt, line_count, jsonl_timestamp_ms
              FROM session_cache",
         )?;
         let rows = stmt.query_map([], |r| {
@@ -110,6 +159,7 @@ impl Store {
                     title_kind: TitleKind::from_tag(&r.get::<_, String>(6)?),
                     first_prompt: r.get(7)?,
                     line_count: r.get(8)?,
+                    jsonl_timestamp_ms: r.get(9)?,
                 },
             ))
         })?;
@@ -127,13 +177,14 @@ impl Store {
         {
             let mut stmt = tx.prepare(
                 "INSERT INTO session_cache
-                   (path, mtime_ns, size, session_id, cwd, title, title_kind, first_prompt, line_count)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+                   (path, mtime_ns, size, session_id, cwd, title, title_kind, first_prompt, line_count, jsonl_timestamp_ms)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)
                  ON CONFLICT(path) DO UPDATE SET
                    mtime_ns=excluded.mtime_ns, size=excluded.size,
                    session_id=excluded.session_id, cwd=excluded.cwd,
                    title=excluded.title, title_kind=excluded.title_kind,
-                   first_prompt=excluded.first_prompt, line_count=excluded.line_count",
+                   first_prompt=excluded.first_prompt, line_count=excluded.line_count,
+                   jsonl_timestamp_ms=excluded.jsonl_timestamp_ms",
             )?;
             for (path, c) in entries {
                 stmt.execute(params![
@@ -146,6 +197,7 @@ impl Store {
                     c.title_kind.as_str(),
                     c.first_prompt,
                     c.line_count,
+                    c.jsonl_timestamp_ms,
                 ])?;
             }
         }
@@ -259,6 +311,7 @@ mod tests {
             title_kind: TitleKind::Custom,
             first_prompt: Some("最初".into()),
             line_count: 3,
+            jsonl_timestamp_ms: Some(1_785_060_000_000),
         }
     }
 
@@ -345,5 +398,107 @@ mod tests {
         drop(s);
         let s2 = Store::open(&path).unwrap();
         assert_eq!(s2.load_cache().unwrap().len(), 1);
+    }
+
+    // ---- 機能3: jsonl_timestamp_ms の永続化 ----
+
+    #[test]
+    fn jsonl_timestampはキャッシュを介して往復する() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.save_cache(&[("/p/a.jsonl".into(), sample("A"))]).unwrap();
+        let loaded = s.load_cache().unwrap();
+        assert_eq!(loaded["/p/a.jsonl"].jsonl_timestamp_ms, Some(1_785_060_000_000));
+    }
+
+    #[test]
+    fn resolved_createdはjsonl_timestampを優先する() {
+        let c = sample("A");
+        let fallback = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        let resolved = c.resolved_created(Some(fallback));
+        assert_eq!(
+            resolved,
+            Some(SystemTime::UNIX_EPOCH + Duration::from_millis(1_785_060_000_000))
+        );
+        assert_ne!(resolved, Some(fallback));
+    }
+
+    #[test]
+    fn resolved_createdはjsonl_timestampが無ければbirthtimeにフォールバックする() {
+        let mut c = sample("A");
+        c.jsonl_timestamp_ms = None;
+        let fallback = SystemTime::UNIX_EPOCH + Duration::from_secs(1);
+        assert_eq!(c.resolved_created(Some(fallback)), Some(fallback));
+    }
+
+    #[test]
+    fn resolved_createdは両方無ければNone() {
+        let mut c = sample("A");
+        c.jsonl_timestamp_ms = None;
+        assert_eq!(c.resolved_created(None), None);
+    }
+
+    #[test]
+    fn millis変換は往復する() {
+        let t = SystemTime::UNIX_EPOCH + Duration::from_millis(1_785_060_000_123);
+        let ms = system_time_to_millis(t).unwrap();
+        assert_eq!(ms, 1_785_060_000_123);
+        assert_eq!(millis_to_system_time(ms), Some(t));
+    }
+
+    #[test]
+    fn 負のmillisは変換できない() {
+        assert_eq!(millis_to_system_time(-1), None);
+    }
+
+    /// 機能3導入前 (jsonl_timestamp_ms 列が無い) の cst.db を模して作る。
+    fn write_legacy_db(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_cache (
+                path         TEXT PRIMARY KEY,
+                mtime_ns     INTEGER NOT NULL,
+                size         INTEGER NOT NULL,
+                session_id   TEXT,
+                cwd          TEXT,
+                title        TEXT NOT NULL,
+                title_kind   TEXT NOT NULL,
+                first_prompt TEXT,
+                line_count   INTEGER NOT NULL
+             );
+             INSERT INTO session_cache
+               (path, mtime_ns, size, session_id, cwd, title, title_kind, first_prompt, line_count)
+             VALUES ('/p/old.jsonl', 1, 2, 's1', '/x', '旧タイトル', 'custom', '最初', 3);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn 旧スキーマのdbは列を追加してキャッシュを再走査させる() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cst.db");
+        write_legacy_db(&path);
+
+        // 開いた時点で列が追加され、jsonl_timestamp_ms を持たない旧キャッシュは
+        // 作成日時の再判定のため破棄される (次回起動時に再走査させるため)
+        let s = Store::open(&path).unwrap();
+        assert!(s.load_cache().unwrap().is_empty(), "移行直後は全件破棄されるはず");
+
+        // 列自体は追加されており、以降は通常どおり保存・読み出しできる
+        let mut s = s;
+        s.save_cache(&[("/p/new.jsonl".into(), sample("新"))]).unwrap();
+        assert_eq!(s.load_cache().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn 新スキーマのdbを開き直しても再走査は起きない() {
+        // 移行が既に済んでいる (列がある) db を開き直しても、キャッシュは保たれる
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cst.db");
+        let mut s = Store::open(&path).unwrap();
+        s.save_cache(&[("/p/a.jsonl".into(), sample("A"))]).unwrap();
+        drop(s);
+
+        let s2 = Store::open(&path).unwrap();
+        assert_eq!(s2.load_cache().unwrap().len(), 1, "既に移行済みのキャッシュは破棄されない");
     }
 }

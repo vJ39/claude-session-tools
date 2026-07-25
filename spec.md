@@ -15,7 +15,7 @@
 - タイトル:
   - 自動: `{"type":"ai-title","aiTitle":"..."}`
   - `/rename`手動: `{"type":"custom-title","customTitle":"..."}` と `{"type":"agent-name","agentName":"..."}` が同時出力。複数回出ることがあるので最後に出現した値を採用する
-- 作成日時: ファイルの`birthtime`(mtimeは最終更新時刻になるため不適)
+- 作成日時: jsonl内最初の行の`timestamp`(ISO8601)を使う。ファイルの`birthtime`はコピー・PC移行等で書き換わり実際のセッション開始日時と乖離するため使わない(実例: 旧Mac→新Mac移行時のコピーで280件のbirthtimeが移行日に一括更新されていた)
 - `cwd`はディレクトリ名(`-Users-work--ghq-chat-slack`等)からの逆算が非可逆(`/`・`.`・`_`が全て`-`化される)なので、必ず各行の`"cwd"`キーを読む
 
 ### タスク永続化
@@ -63,10 +63,13 @@ CREATE TABLE work_log (
 1セッション1行、以下の列を表示する:
 
 - session id(先頭8桁で表示、フルIDは詳細表示や操作時に使う)
-- タイトル(custom-title優先、無ければai-title、両方無ければ最初のuserメッセージ冒頭を表示、それも取得できなければ`(無題)`)
+- タイトル(custom-title優先、無ければai-title、両方無ければ最初の実質的なuserメッセージ冒頭を表示、それも取得できなければ`(無題)`)
+  - スラッシュコマンド実行はuserメッセージが`<command-name>.../<command-message>...`という内部表現の生テキストになる。これは実質的な発言とみなさずスキップし、次のuserメッセージを探す
+  - 全てのuserメッセージがコマンド実行だけだったセッションは、最後の手段として`<command-name>`の中身(例: `/kibela-reflect`)をタイトルに使う
 - 紐づくRedmineチケット番号(タイトル/タスクsubjectから抽出、複数あれば全部)
 - タスク数: `pending` / `in_progress` / `done` の内訳
-- 作成日時(jsonlファイルのbirthtime)
+- 作成日時(jsonl内最初の行のtimestamp)
+- cwdが現存するかどうかを可視化する(resumeしてから気づくのではなく一覧の時点で分かるようにする)
 
 デフォルトは作成日時降順。
 
@@ -74,12 +77,14 @@ CREATE TABLE work_log (
 
 ### 操作
 
-- **resume起動**: 選択したセッションのcwdへ`cd`した上で`claude --resume <sessionId>`を起動する(cwdが現存しない場合はエラー表示)
+- **resume起動**: 選択したセッションのcwdへ`cd`した上で`claude --resume <sessionId>`を起動する(cwdが現存しない場合はエラー表示)。claude終了(`/exit`等)後はcst自体を終了せず一覧に戻る(該当セッションのjsonlだけ再走査され、他はキャッシュが効く)
+- **cwd一時上書き**: cwdが存在しない/変更したいセッションを、専用キーでresume起動時のcwdだけその場で上書きしてから起動する。jsonl本体は書き換えない(永続的なパス一括置換は対象外、必要になったら別のバッチ操作として設計する)
 - **削除**: 対象jsonl・対応する`~/.claude/tasks/<sessionId>/`を削除する。実行中(セッションレジストリに`status: idle/busy/bg`で存在)のセッションは削除前に警告し、確認を挟む
 - **アーカイブ**: 別ディレクトリ(`~/.claude/projects-archive/`等)へ移動する(削除より安全な選択肢)
 - **内容検索してジャンプ**: キーワードでjsonl全文をgrepし、ヒットしたセッションに絞り込む
 - **分類・タグ付け**: ツール側の別ストア(sqlite等)に手動タグを保存する。jsonl自体は編集しない
 - **要約・recap**: 選択したセッションに対し `claude --resume <sessionId> -p "<要約prompt>" --model <軽量モデル>` をサブプロセスとして呼び出し、結果を表示する。Rust側でAnthropic API鍵を直接扱わず、既存のclaude CLI認証をそのまま使う
+- **ヘルプ表示**: 専用キーでショートカット一覧と各操作の挙動(確認が必要な操作等)を説明するオーバーレイを開閉できる。既存のキーバインドと衝突しないキーを割り当てる
 
 ### merge-session.pyの移植(サブコマンド化)
 

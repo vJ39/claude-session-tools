@@ -24,6 +24,9 @@ pub struct SessionRow {
     pub project_dir: String,
     /// jsonl 内の cwd (ディレクトリ名からの逆算は非可逆なので必ずこちらを使う)
     pub cwd: Option<String>,
+    /// cwd が現存するか (機能6: 消えた作業ディレクトリを一覧で見分ける)。
+    /// cwd が記録されていない場合も resume できないので false 扱い。
+    pub cwd_exists: bool,
     pub title: String,
     pub title_kind: TitleKind,
     pub tickets: Vec<u64>,
@@ -87,6 +90,12 @@ impl SessionRow {
     /// 実行中かどうか。
     pub fn is_running(&self) -> bool {
         self.running.is_some()
+    }
+
+    /// cwd が消えている (もしくは記録が無い) か (機能6)。
+    /// このセッションは resume できないので、一覧で見分けられるようにする。
+    pub fn cwd_missing(&self) -> bool {
+        !self.cwd_exists
     }
 
     /// fuzzy 検索の対象文字列。
@@ -184,16 +193,25 @@ pub fn build(
                 }
             }
 
+            // cwd が現存するか (機能6)。記録なし・消滅どちらも false。
+            let cwd_exists = s
+                .cwd
+                .as_deref()
+                .map(|c| std::path::Path::new(c).is_dir())
+                .unwrap_or(false);
+
             let mut row = SessionRow {
                 session_id: s.session_id.clone(),
                 path: s.target.path,
                 project_dir: s.target.project_dir,
                 cwd: s.cwd,
+                cwd_exists,
                 title: s.title,
                 title_kind: s.title_kind,
                 tickets,
                 tasks: task_summary,
-                created: s.target.created,
+                // jsonl 内 timestamp を優先した解決済みの値 (機能3)。birthtime は使わない
+                created: s.created,
                 modified: s.target.modified,
                 running: running.get(&s.session_id).cloned(),
                 tags: tags.get(&s.session_id).cloned().unwrap_or_default(),
@@ -251,6 +269,7 @@ mod tests {
             title_kind: TitleKind::Custom,
             first_prompt: Some("最初の質問".into()),
             line_count: 42,
+            created,
         }
     }
 
@@ -456,6 +475,36 @@ mod tests {
         let rows = build(vec![scanned("s1", "x", Some(t(1)))], &tasks, &running, &wl, &tags);
         assert_eq!(rows[0].format_tasks(), "");
         assert_eq!(rows[0].format_tickets(), "");
+    }
+
+    #[test]
+    fn cwdが現存すればcwd_existsがtrue() {
+        let (tasks, running, wl, tags) = empty();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut s = scanned("s1", "x", Some(t(1)));
+        s.cwd = Some(tmp.path().to_string_lossy().to_string());
+        let rows = build(vec![s], &tasks, &running, &wl, &tags);
+        assert!(rows[0].cwd_exists);
+        assert!(!rows[0].cwd_missing());
+    }
+
+    #[test]
+    fn cwdが消えていればcwd_missing() {
+        let (tasks, running, wl, tags) = empty();
+        let mut s = scanned("s1", "x", Some(t(1)));
+        s.cwd = Some("/存在しないディレクトリ/abc".into());
+        let rows = build(vec![s], &tasks, &running, &wl, &tags);
+        assert!(!rows[0].cwd_exists);
+        assert!(rows[0].cwd_missing());
+    }
+
+    #[test]
+    fn cwdが無ければcwd_missing() {
+        let (tasks, running, wl, tags) = empty();
+        let mut s = scanned("s1", "x", Some(t(1)));
+        s.cwd = None;
+        let rows = build(vec![s], &tasks, &running, &wl, &tags);
+        assert!(rows[0].cwd_missing());
     }
 
     #[test]

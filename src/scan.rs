@@ -70,6 +70,9 @@ pub struct ScannedSession {
     pub title_kind: TitleKind,
     pub first_prompt: Option<String>,
     pub line_count: i64,
+    /// 作成日時。jsonl 内 timestamp を優先し、無ければ (壊れたファイル等)
+    /// `target.created` (ファイルの birthtime) にフォールバック済みの値 (機能3)
+    pub created: Option<SystemTime>,
 }
 
 /// 走査の設定。
@@ -256,6 +259,8 @@ fn from_cache(target: &ScanTarget, c: &CachedSession) -> ScannedSession {
         title_kind: c.title_kind,
         first_prompt: c.first_prompt.clone(),
         line_count: c.line_count,
+        // jsonl 内 timestamp を優先し、無ければファイルの birthtime にフォールバックする (機能3)
+        created: c.resolved_created(target.created),
         target: target.clone(),
     }
 }

@@ -4,7 +4,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, TableState};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Paragraph, Row, Table, TableState};
 
 use crate::rows::SessionRow;
 use crate::session::oneline_preview;
@@ -15,6 +15,9 @@ pub const HEADERS: [&str; 6] = ["ID", "作成日時", "P/I/D", "チケット", "
 
 /// 実行中セッションに付ける印。
 const RUNNING_MARK: &str = "●";
+
+/// cwd が消えている (resume 不可) セッションに付ける印 (機能6)。
+const CWD_MISSING_MARK: &str = "✗";
 
 /// 1 行分のセル文字列を作る。
 pub fn row_cells(row: &SessionRow) -> [String; 6] {
@@ -27,24 +30,32 @@ pub fn row_cells(row: &SessionRow) -> [String; 6] {
     if !row.tags.is_empty() {
         title = format!("{title} [{}]", row.format_tags());
     }
+    // cwd が消えている行は resume できないので、プロジェクト欄に印を付ける (機能6)
+    let project = if row.cwd_missing() {
+        format!("{CWD_MISSING_MARK} {}", row.project_label())
+    } else {
+        row.project_label()
+    };
     [
         id,
         row.format_created(),
         row.format_tasks(),
         row.format_tickets(),
         title,
-        row.project_label(),
+        project,
     ]
 }
 
 /// 選択行の詳細 (画面下部)。
 pub fn detail_lines(row: &SessionRow) -> Vec<String> {
     let mut out = Vec::new();
-    out.push(format!(
-        "{}  {}",
-        row.session_id,
-        row.cwd.as_deref().unwrap_or("(cwd 不明)")
-    ));
+    // cwd が消えていれば resume できない旨を明示する (機能6)
+    let cwd = match &row.cwd {
+        None => "(cwd 不明)".to_string(),
+        Some(c) if row.cwd_missing() => format!("{c}  ({CWD_MISSING_MARK} 消滅・resume 不可)"),
+        Some(c) => c.clone(),
+    };
+    out.push(format!("{}  {}", row.session_id, cwd));
 
     let mut meta = vec![
         format!("{} 行", row.line_count),
@@ -85,8 +96,27 @@ pub fn header_line(app: &App) -> String {
     s
 }
 
-/// キー操作の案内。表示状態そのものはヘッダ行に常時出るので、ここではキーの案内だけ。
-pub const HELP: &str = "Enter:resume  ^g:内容検索  ^t:タグ  ^r:要約  ^s:サブエージェント表示切替  ^d:削除  ^a:アーカイブ  ^u:クリア  Esc:戻る/終了";
+/// ステータス行に常時出す一行ヘルプ。詳しい一覧は `?` のオーバーレイ (機能5)。
+pub const HELP: &str = "Enter:resume  ^w:cwd指定resume  ^g:内容検索  ^t:タグ  ^d:削除  ^a:アーカイブ  ?:ヘルプ  Esc:戻る/終了";
+
+/// `?` で開くヘルプオーバーレイの中身 (機能5)。1 行 1 ショートカット。
+pub const HELP_LINES: [&str; 15] = [
+    "cst セッションブラウザ ― ショートカット",
+    "",
+    "  Enter        選択セッションを resume (cwd が消えていると不可)",
+    "  ^w           cwd を一時指定して resume (jsonl は書き換えない)",
+    "  ↑/↓ ^p/^n    カーソル移動      PgUp/PgDn 10 行  Home/End 端へ",
+    "  文字入力      タイトル/ID/cwd/チケット/タグを fuzzy 絞り込み",
+    "  ^u           クエリ/入力をクリア",
+    "  ^g           jsonl 全文検索 (内容検索)",
+    "  ^t           タグ付け (空 Enter で全解除)",
+    "  ^r           セッションを要約 (recap)",
+    "  ^s           サブエージェント記録の表示切替",
+    "  ^d / ^a      削除 / アーカイブ (確認あり)",
+    "  ?            このヘルプ",
+    "  Esc          クエリ→内容検索→終了 の順に解除    ^c 即終了",
+    "  任意のキーで閉じる",
+];
 
 /// 画面全体を描く。
 pub fn draw(frame: &mut Frame, app: &App, state: &mut TableState) {
@@ -103,6 +133,40 @@ pub fn draw(frame: &mut Frame, app: &App, state: &mut TableState) {
     draw_table(frame, areas[1], app, state);
     draw_detail(frame, areas[2], app);
     draw_status(frame, areas[3], app);
+
+    // ヘルプは一覧の上に重ねて出す (機能5)
+    if app.mode == Mode::Help {
+        draw_help(frame);
+    }
+}
+
+/// ヘルプオーバーレイを画面中央に重ねて描く (機能5)。
+fn draw_help(frame: &mut Frame) {
+    let area = centered_rect(frame.area(), HELP_LINES);
+    let text: Vec<Line> = HELP_LINES.iter().map(|l| Line::from(*l)).collect();
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" ヘルプ (任意のキーで閉じる) ")
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    // 下地を消してから重ねる
+    frame.render_widget(Clear, area);
+    frame.render_widget(Paragraph::new(text).block(block), area);
+}
+
+/// ヘルプ本文が収まる矩形を画面中央に作る。画面が小さければ全面に丸める。
+fn centered_rect(full: Rect, lines: [&str; 15]) -> Rect {
+    // 罫線 + 左右の余白を見込んだ幅・高さ
+    let content_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
+    let want_w = (content_w + 4).min(full.width);
+    let want_h = (lines.len() as u16 + 2).min(full.height);
+    let x = full.x + (full.width.saturating_sub(want_w)) / 2;
+    let y = full.y + (full.height.saturating_sub(want_h)) / 2;
+    Rect {
+        x,
+        y,
+        width: want_w,
+        height: want_h,
+    }
 }
 
 fn draw_query(frame: &mut Frame, area: Rect, app: &App) {
@@ -123,8 +187,11 @@ fn draw_table(frame: &mut Frame, area: Rect, app: &App, state: &mut TableState) 
         .map(|&i| {
             let row = &app.rows[i];
             let cells = row_cells(row);
+            // 実行中は緑、cwd が消えた resume 不可の行は暗く (機能6)。実行中を優先。
             let style = if row.is_running() {
                 Style::default().fg(Color::Green)
+            } else if row.cwd_missing() {
+                Style::default().fg(Color::DarkGray)
             } else {
                 Style::default()
             };
@@ -179,6 +246,11 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
             Some(s) => (s.clone(), Style::default().fg(Color::Yellow)),
             None => (HELP.to_string(), Style::default().fg(Color::DarkGray)),
         },
+        // ヘルプ表示中はステータス行にも案内を出す
+        Mode::Help => (
+            "任意のキーで閉じる".to_string(),
+            Style::default().fg(Color::DarkGray),
+        ),
     };
     frame.render_widget(Paragraph::new(Line::from(text)).style(style), area);
 }
@@ -198,6 +270,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn build_row(running: bool, tags: Vec<String>) -> SessionRow {
+        let created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000));
         let scanned = ScannedSession {
             target: ScanTarget {
                 path: PathBuf::from("/p/proj/aaaa1111-2222.jsonl"),
@@ -206,7 +279,7 @@ mod tests {
                 file_stem: "aaaa1111-2222".into(),
                 size: 2048,
                 mtime_ns: 0,
-                created: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000)),
+                created,
                 modified: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_003_600)),
             },
             session_id: "aaaa1111-2222".into(),
@@ -215,6 +288,7 @@ mod tests {
             title_kind: TitleKind::Custom,
             first_prompt: Some("最初の\n質問".into()),
             line_count: 120,
+            created,
         };
 
         let mut tasks = HashMap::new();
@@ -256,10 +330,14 @@ mod tests {
             tag_map.insert("aaaa1111-2222".to_string(), tags);
         }
 
-        rows::build(vec![scanned], &tasks, &run_map, &wl, &tag_map)
+        let mut row = rows::build(vec![scanned], &tasks, &run_map, &wl, &tag_map)
             .into_iter()
             .next()
-            .unwrap()
+            .unwrap();
+        // cwd の実在はマシン依存なので、表示テストが安定するよう既定で「現存」に固定する。
+        // 消滅時の表示は専用テストで cwd_exists=false を明示して確かめる。
+        row.cwd_exists = true;
+        row
     }
 
     #[test]
@@ -278,6 +356,28 @@ mod tests {
     fn 実行中は印がつく() {
         let cells = row_cells(&build_row(true, vec![]));
         assert!(cells[0].starts_with(RUNNING_MARK));
+    }
+
+    #[test]
+    fn cwdが現存すればプロジェクト欄に印は付かない() {
+        let cells = row_cells(&build_row(false, vec![]));
+        assert!(!cells[5].starts_with(CWD_MISSING_MARK));
+    }
+
+    #[test]
+    fn cwdが消えていればプロジェクト欄に印がつく() {
+        let mut row = build_row(false, vec![]);
+        row.cwd_exists = false;
+        let cells = row_cells(&row);
+        assert!(cells[5].starts_with(CWD_MISSING_MARK));
+    }
+
+    #[test]
+    fn cwd消滅は詳細にresume不可と出る() {
+        let mut row = build_row(false, vec![]);
+        row.cwd_exists = false;
+        let lines = detail_lines(&row);
+        assert!(lines[0].contains("resume 不可"));
     }
 
     #[test]
@@ -350,8 +450,43 @@ mod tests {
     }
 
     #[test]
-    fn ヘルプにサブエージェント切替キーの案内がある() {
-        assert!(HELP.contains("^s"));
+    fn 一行ヘルプに主要キーの案内がある() {
+        assert!(HELP.contains("?:ヘルプ"));
+        assert!(HELP.contains("^w"));
+    }
+
+    #[test]
+    fn ヘルプオーバーレイにサブエージェント切替の案内がある() {
+        // 詳しい案内はオーバーレイ側に移した
+        assert!(HELP_LINES.iter().any(|l| l.contains("^s")));
+        assert!(HELP_LINES.iter().any(|l| l.contains("^w")));
+    }
+
+    #[test]
+    fn ヘルプ表示中はオーバーレイが描かれる() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(vec![build_row(false, vec![])]);
+        app.mode = Mode::Help;
+        let mut terminal = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let mut state = TableState::default();
+        terminal.draw(|f| draw(f, &app, &mut state)).unwrap();
+        let dump = terminal.backend().to_string();
+        assert!(dump.contains("ショートカット"));
+        assert!(dump.contains("cwd を一時指定"));
+    }
+
+    #[test]
+    fn 小さい画面でもヘルプで落ちない() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = App::new(vec![build_row(false, vec![])]);
+        app.mode = Mode::Help;
+        let mut terminal = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        let mut state = TableState::default();
+        terminal.draw(|f| draw(f, &app, &mut state)).unwrap();
     }
 
     #[test]

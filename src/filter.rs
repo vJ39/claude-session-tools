@@ -85,6 +85,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn scanned(id: &str, title: &str, cwd: &str, secs: u64) -> ScannedSession {
+        let created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
         ScannedSession {
             target: ScanTarget {
                 path: PathBuf::from(format!("/p/proj/{id}.jsonl")),
@@ -93,7 +94,7 @@ mod tests {
                 file_stem: id.into(),
                 size: 10,
                 mtime_ns: 0,
-                created: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+                created,
                 modified: None,
             },
             session_id: id.into(),
@@ -102,6 +103,7 @@ mod tests {
             title_kind: TitleKind::Custom,
             first_prompt: None,
             line_count: 1,
+            created,
         }
     }
 

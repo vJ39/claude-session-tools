@@ -90,6 +90,12 @@ fn event_loop(
                 Ok(spec) => return Ok(PostAction::Resume(spec)),
                 Err(e) => app.set_status(format!("resume できない: {e}")),
             },
+            Effect::ResumeWithCwd(index, cwd) => {
+                match actions::resume_command_with_cwd(&app.rows[index], &cwd) {
+                    Ok(spec) => return Ok(PostAction::Resume(spec)),
+                    Err(e) => app.set_status(format!("resume できない: {e}")),
+                }
+            }
             Effect::Delete(index) => handle_delete(app, paths, store, index),
             Effect::Archive(index) => handle_archive(app, paths, store, index),
             Effect::Grep(needle) => handle_grep(terminal, app, &mut table_state, needle)?,
@@ -288,6 +294,10 @@ mod tests {
                 let path = proj.join(format!("{session_id}.jsonl"));
                 fs::write(&path, body).unwrap();
 
+                let created = Some(
+                    std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(100 - i as u64),
+                );
                 ScannedSession {
                     target: ScanTarget {
                         path,
@@ -296,10 +306,7 @@ mod tests {
                         file_stem: (*session_id).into(),
                         size: body.len() as u64,
                         mtime_ns: 0,
-                        created: Some(
-                            std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(100 - i as u64),
-                        ),
+                        created,
                         modified: None,
                     },
                     session_id: (*session_id).into(),
@@ -308,6 +315,7 @@ mod tests {
                     title_kind: TitleKind::Ai,
                     first_prompt: None,
                     line_count: 1,
+                    created,
                 }
             })
             .collect();
@@ -344,6 +352,7 @@ mod tests {
                     title_kind: TitleKind::Ai,
                     first_prompt: None,
                     line_count: 1,
+                    jsonl_timestamp_ms: None,
                 },
             )])
             .unwrap();

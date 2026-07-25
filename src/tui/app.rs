@@ -23,6 +23,8 @@ pub enum InputKind {
     Grep,
     /// タグ付け
     Tag,
+    /// resume 時の cwd を一時上書きする (機能8)。jsonl は書き換えない
+    ResumeCwd,
 }
 
 /// 画面のモード。
@@ -38,6 +40,8 @@ pub enum Mode {
         prompt: String,
         buffer: String,
     },
+    /// ショートカット一覧のオーバーレイ (機能5)
+    Help,
 }
 
 /// 外側 (イベントループ) に実行してもらう副作用。
@@ -47,6 +51,9 @@ pub enum Effect {
     Quit,
     /// 行インデックス (rows 側の添字)
     Resume(usize),
+    /// cwd を一時的に上書きして resume する (機能8)。行インデックスと上書き先の cwd。
+    /// jsonl は書き換えず、この起動限りで cwd を差し替える。
+    ResumeWithCwd(usize, String),
     Delete(usize),
     Archive(usize),
     Recap(usize),
@@ -204,7 +211,18 @@ impl App {
             Mode::Normal => self.on_key_normal(key),
             Mode::Confirm { kind, .. } => self.on_key_confirm(key, kind),
             Mode::Input { kind, prompt, buffer } => self.on_key_input(key, kind, prompt, buffer),
+            Mode::Help => self.on_key_help(key),
         }
+    }
+
+    /// ヘルプ表示中のキー処理 (機能5)。^c だけ終了、それ以外の何かで閉じる。
+    fn on_key_help(&mut self, key: KeyEvent) -> Effect {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && key.code == KeyCode::Char('c') {
+            return Effect::Quit;
+        }
+        self.mode = Mode::Normal;
+        Effect::None
     }
 
     fn on_key_normal(&mut self, key: KeyEvent) -> Effect {
@@ -252,6 +270,22 @@ impl App {
                     None => Effect::None,
                 },
                 KeyCode::Char('s') => Effect::ToggleSubagents,
+                // cwd を一時上書きして resume (機能8)。現 cwd を初期値に入れて編集させる
+                KeyCode::Char('w') => {
+                    if self.selected_index().is_none() {
+                        return Effect::None;
+                    }
+                    let buffer = self
+                        .selected()
+                        .and_then(|r| r.cwd.clone())
+                        .unwrap_or_default();
+                    self.mode = Mode::Input {
+                        kind: InputKind::ResumeCwd,
+                        prompt: "resume する cwd (Enter で確定・jsonl は書き換えない)".to_string(),
+                        buffer,
+                    };
+                    Effect::None
+                }
                 _ => Effect::None,
             };
         }
@@ -274,6 +308,12 @@ impl App {
                 Some(i) => Effect::Resume(i),
                 None => Effect::None,
             },
+            // ヘルプ (機能5)。クエリが空のときだけ ? をヘルプに割り当て、
+            // 入力途中で ? を打ちたい場合は絞り込み文字として通す
+            KeyCode::Char('?') if self.query.is_empty() => {
+                self.mode = Mode::Help;
+                Effect::None
+            }
             KeyCode::Down => {
                 self.move_cursor(1);
                 Effect::None
@@ -402,6 +442,12 @@ impl App {
                         Some(i) => Effect::AddTag(i, text),
                         None => Effect::None,
                     },
+                    // 空入力なら通常の resume と同じ扱い (上書きしない)。機能8
+                    InputKind::ResumeCwd => match self.selected_index() {
+                        Some(i) if text.is_empty() => Effect::Resume(i),
+                        Some(i) => Effect::ResumeWithCwd(i, text),
+                        None => Effect::None,
+                    },
                 }
             }
             KeyCode::Backspace => {
@@ -434,6 +480,7 @@ mod tests {
     use std::time::{Duration, SystemTime};
 
     fn scanned(id: &str, title: &str, secs: u64) -> ScannedSession {
+        let created = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs));
         ScannedSession {
             target: ScanTarget {
                 path: PathBuf::from(format!("/p/proj/{id}.jsonl")),
@@ -442,7 +489,7 @@ mod tests {
                 file_stem: id.into(),
                 size: 10,
                 mtime_ns: 0,
-                created: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(secs)),
+                created,
                 modified: None,
             },
             session_id: id.into(),
@@ -451,6 +498,7 @@ mod tests {
             title_kind: TitleKind::Custom,
             first_prompt: None,
             line_count: 1,
+            created,
         }
     }
 
@@ -801,6 +849,85 @@ mod tests {
         let mut app = app();
         app.on_key(code(KeyCode::Down));
         assert_eq!(app.on_key(ctrl('r')), Effect::Recap(1));
+    }
+
+    #[test]
+    fn クエリが空なら疑問符でヘルプを開く() {
+        let mut app = app();
+        assert_eq!(app.on_key(key('?')), Effect::None);
+        assert_eq!(app.mode, Mode::Help);
+        // 何かキーを押すと閉じる
+        assert_eq!(app.on_key(code(KeyCode::Esc)), Effect::None);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn ヘルプ表示中はctrl_cで終了できる() {
+        let mut app = app();
+        app.on_key(key('?'));
+        assert_eq!(app.on_key(ctrl('c')), Effect::Quit);
+    }
+
+    #[test]
+    fn クエリ入力中の疑問符は絞り込み文字として扱う() {
+        let mut app = app();
+        app.on_key(key('コ'));
+        // クエリが空でないので ? はヘルプにならず query に積まれる
+        assert_eq!(app.on_key(key('?')), Effect::None);
+        assert_eq!(app.mode, Mode::Normal);
+        assert_eq!(app.query, "コ?");
+    }
+
+    #[test]
+    fn ctrl_wでcwd上書きの入力に入り現cwdが初期値になる() {
+        let mut app = app();
+        assert_eq!(app.on_key(ctrl('w')), Effect::None);
+        match &app.mode {
+            Mode::Input { kind, buffer, .. } => {
+                assert_eq!(*kind, InputKind::ResumeCwd);
+                assert_eq!(buffer, "/Users/work/.ghq/repo");
+            }
+            other => panic!("cwd 上書き入力になっていない: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cwd上書き入力を確定するとResumeWithCwdが出る() {
+        let mut app = app();
+        app.on_key(ctrl('w'));
+        // 既定の初期値を消して別のパスを入れる
+        app.on_key(ctrl('u'));
+        for c in "/tmp/newcwd".chars() {
+            app.on_key(key(c));
+        }
+        assert_eq!(
+            app.on_key(code(KeyCode::Enter)),
+            Effect::ResumeWithCwd(0, "/tmp/newcwd".into())
+        );
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn cwd上書きを空Enterで確定すると通常resumeになる() {
+        let mut app = app();
+        app.on_key(ctrl('w'));
+        app.on_key(ctrl('u')); // 初期値を消す
+        assert_eq!(app.on_key(code(KeyCode::Enter)), Effect::Resume(0));
+    }
+
+    #[test]
+    fn cwd上書き入力はescで中止できる() {
+        let mut app = app();
+        app.on_key(ctrl('w'));
+        assert_eq!(app.on_key(code(KeyCode::Esc)), Effect::None);
+        assert_eq!(app.mode, Mode::Normal);
+    }
+
+    #[test]
+    fn 選択が無ければcwd上書きに入れない() {
+        let mut app = App::new(Vec::new());
+        assert_eq!(app.on_key(ctrl('w')), Effect::None);
+        assert_eq!(app.mode, Mode::Normal);
     }
 
     #[test]

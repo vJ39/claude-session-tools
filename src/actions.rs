@@ -49,6 +49,23 @@ pub fn resume_command(row: &SessionRow) -> Result<CommandSpec> {
     })
 }
 
+/// cwd を一時的に上書きして resume する (機能8)。
+///
+/// jsonl は書き換えず、この起動限りで作業ディレクトリを差し替える。
+/// 元の cwd が消えたセッションを別ディレクトリで開き直したいときに使う。
+/// 指定先が現存しない場合はエラー。
+pub fn resume_command_with_cwd(row: &SessionRow, cwd_override: &str) -> Result<CommandSpec> {
+    let cwd = PathBuf::from(cwd_override.trim());
+    if !cwd.is_dir() {
+        bail!("指定した cwd が存在しない: {}", cwd.display());
+    }
+    Ok(CommandSpec {
+        program: claude_bin(),
+        args: vec!["--resume".to_string(), row.session_id.clone()],
+        cwd,
+    })
+}
+
 /// 要約 (recap) 用の既定プロンプト。
 pub const RECAP_PROMPT: &str = "このセッションでやったことを日本語で要約して。\
 出力は次の3項目だけ: 1) 何をやったか 2) 決まったこと 3) 残っている作業。\
@@ -191,6 +208,7 @@ mod tests {
     use std::fs;
 
     fn row_for(path: &Path, session_id: &str, cwd: Option<&str>) -> SessionRow {
+        let created = Some(std::time::SystemTime::UNIX_EPOCH);
         let scanned = ScannedSession {
             target: ScanTarget {
                 path: path.to_path_buf(),
@@ -199,7 +217,7 @@ mod tests {
                 file_stem: session_id.into(),
                 size: 1,
                 mtime_ns: 0,
-                created: Some(std::time::SystemTime::UNIX_EPOCH),
+                created,
                 modified: None,
             },
             session_id: session_id.into(),
@@ -208,6 +226,7 @@ mod tests {
             title_kind: TitleKind::Ai,
             first_prompt: None,
             line_count: 1,
+            created,
         };
         let tasks: HashMap<String, TaskSummary> = HashMap::new();
         let running: HashMap<String, RunningSession> = HashMap::new();
@@ -244,6 +263,25 @@ mod tests {
         let row = row_for(&tmp.path().join("s.jsonl"), "abc", Some("/存在しないディレクトリ/x"));
         let err = resume_command(&row).unwrap_err();
         assert!(err.to_string().contains("cwd が存在しない"), "{err}");
+    }
+
+    #[test]
+    fn cwdを上書きしてresumeできる() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        // 元 cwd は消えている行でも、別ディレクトリを指定すれば resume できる
+        let row = row_for(&tmp.path().join("s.jsonl"), "abc-123", Some("/存在しない/x"));
+        let spec = resume_command_with_cwd(&row, other.path().to_str().unwrap()).unwrap();
+        assert_eq!(spec.args, vec!["--resume", "abc-123"]);
+        assert_eq!(spec.cwd, other.path());
+    }
+
+    #[test]
+    fn 上書き先が存在しなければresumeできない() {
+        let tmp = tempfile::tempdir().unwrap();
+        let row = row_for(&tmp.path().join("s.jsonl"), "abc", Some("/tmp"));
+        let err = resume_command_with_cwd(&row, "/存在しないディレクトリ/y").unwrap_err();
+        assert!(err.to_string().contains("指定した cwd が存在しない"), "{err}");
     }
 
     #[test]

@@ -105,6 +105,10 @@ mod tests {
             .map(|(i, (id, body))| {
                 let path = dir.join(format!("{id}.jsonl"));
                 fs::write(&path, body).unwrap();
+                let created = Some(
+                    std::time::SystemTime::UNIX_EPOCH
+                        + std::time::Duration::from_secs(100 - i as u64),
+                );
                 ScannedSession {
                     target: ScanTarget {
                         path: PathBuf::from(&path),
@@ -113,10 +117,7 @@ mod tests {
                         file_stem: (*id).into(),
                         size: body.len() as u64,
                         mtime_ns: 0,
-                        created: Some(
-                            std::time::SystemTime::UNIX_EPOCH
-                                + std::time::Duration::from_secs(100 - i as u64),
-                        ),
+                        created,
                         modified: None,
                     },
                     session_id: (*id).into(),
@@ -125,6 +126,7 @@ mod tests {
                     title_kind: TitleKind::Ai,
                     first_prompt: None,
                     line_count: 1,
+                    created,
                 }
             })
             .collect();

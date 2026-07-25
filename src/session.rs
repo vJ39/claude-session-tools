@@ -4,7 +4,9 @@
 //! 必要なキーを含む可能性がある行だけを部分的にパースする。
 
 use std::io::BufRead;
+use std::time::{Duration, SystemTime};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
 /// タイトルの出所。custom-title (`/rename`) > ai-title の優先順位。
@@ -18,6 +20,9 @@ pub enum TitleKind {
     AgentName,
     /// custom/ai/agent-name が無いときのフォールバック (最初の user メッセージ冒頭)
     FirstPrompt,
+    /// 上記が全部無い・かつ全 user メッセージがスラッシュコマンド実行だった場合の
+    /// 最後の手段 (`<command-name>` タグの中身)
+    SlashCommand,
     /// タイトル行も user メッセージも無い
     None,
 }
@@ -29,6 +34,7 @@ impl TitleKind {
             TitleKind::Ai => "ai",
             TitleKind::AgentName => "agent",
             TitleKind::FirstPrompt => "first_prompt",
+            TitleKind::SlashCommand => "slash_command",
             TitleKind::None => "none",
         }
     }
@@ -40,6 +46,7 @@ impl TitleKind {
             "ai" => TitleKind::Ai,
             "agent" => TitleKind::AgentName,
             "first_prompt" => TitleKind::FirstPrompt,
+            "slash_command" => TitleKind::SlashCommand,
             _ => TitleKind::None,
         }
     }
@@ -55,6 +62,15 @@ const THINKING_MARKER: &str = "[thinking...]";
 /// 最初の user メッセージ冒頭の表示文字数。
 const TITLE_FALLBACK_LIMIT: usize = 40;
 
+/// スラッシュコマンド実行の内部表現に含まれるタグ。
+/// 実データでは `<command-name>`・`<command-message>`・`<command-args>` が
+/// 前後関係を問わず出現するが、判定には `<command-name>` があれば十分で、
+/// かつ最後の手段のタイトルにはこのタグの中身を使う。
+const COMMAND_NAME_OPEN: &str = "<command-name>";
+const COMMAND_NAME_CLOSE: &str = "</command-name>";
+/// `<command-name>` を伴わずに単独で出ることもあるため、これも検出対象にする。
+const COMMAND_MESSAGE_TAG: &str = "<command-message>";
+
 /// jsonl 1 ファイルから取り出したメタ情報。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JsonlMeta {
@@ -68,8 +84,14 @@ pub struct JsonlMeta {
     pub ai_title: Option<String>,
     /// agent-name の最後の値
     pub agent_name: Option<String>,
-    /// 最初の user メッセージの本文 (プレビュー用・切り詰め済み)
+    /// 最初の、スラッシュコマンド実行ではない user メッセージの本文 (プレビュー用・切り詰め済み)
     pub first_prompt: Option<String>,
+    /// 最初に見つかった `<command-name>` タグの中身。
+    /// 全 user メッセージがスラッシュコマンド実行だったセッションの、最後の手段のタイトルに使う
+    pub first_command_name: Option<String>,
+    /// 各行の `timestamp` (最初に見つかったもの・パース済み)。
+    /// ファイルの birthtime はコピー・PC移行等で書き換わるため、作成日時にはこちらを優先する
+    pub timestamp: Option<SystemTime>,
     /// 空行を除いた行数
     pub line_count: u64,
     /// JSON として読めなかった行数
@@ -79,7 +101,8 @@ pub struct JsonlMeta {
 impl JsonlMeta {
     /// 表示に使うタイトルと、その出所を返す。
     ///
-    /// 優先順位: custom-title > ai-title > agent-name > 最初の user メッセージ冒頭 > `(無題)`。
+    /// 優先順位: custom-title > ai-title > agent-name > 最初の実質的な user メッセージ冒頭 >
+    /// (全 user メッセージがスラッシュコマンド実行だった場合の最後の手段) `<command-name>` の中身 > `(無題)`。
     pub fn title(&self) -> (String, TitleKind) {
         if let Some(t) = non_empty(&self.custom_title) {
             return (t, TitleKind::Custom);
@@ -96,8 +119,44 @@ impl JsonlMeta {
                 return (preview, TitleKind::FirstPrompt);
             }
         }
+        if let Some(cmd) = non_empty(&self.first_command_name) {
+            let preview = oneline_preview(&cmd, TITLE_FALLBACK_LIMIT);
+            if !preview.is_empty() {
+                return (preview, TitleKind::SlashCommand);
+            }
+        }
         (UNTITLED.to_string(), TitleKind::None)
     }
+}
+
+/// テキストがスラッシュコマンド実行の内部表現かどうか。
+///
+/// `<command-name>` と `<command-message>` はどちらが先に出現するか順序を問わない
+/// (実データではタグの並びが前後することがある)ので、単純な部分文字列の有無で判定する。
+fn is_slash_command_text(text: &str) -> bool {
+    text.contains(COMMAND_NAME_OPEN) || text.contains(COMMAND_MESSAGE_TAG)
+}
+
+/// `<command-name>...</command-name>` の中身を取り出す。
+/// タグが無い・閉じタグが無い・中身が空白のみの場合は `None`。
+/// 他のタグに囲まれていても (ネストしていても) 部分文字列探索なので影響を受けない。
+fn extract_command_name(text: &str) -> Option<String> {
+    let start = text.find(COMMAND_NAME_OPEN)? + COMMAND_NAME_OPEN.len();
+    let rest = &text[start..];
+    let end = rest.find(COMMAND_NAME_CLOSE)?;
+    let name = rest[..end].trim();
+    if name.is_empty() { None } else { Some(name.to_string()) }
+}
+
+/// jsonl の `timestamp` (ISO8601 UTC、例 `"2026-07-25T10:00:00.000Z"`) をパースする。
+/// Claude Code のセッションは全て 1970 年以降なので、負の値 (壊れたデータ) は捨てる。
+fn parse_timestamp(s: &str) -> Option<SystemTime> {
+    let dt: DateTime<Utc> = DateTime::parse_from_rfc3339(s).ok()?.with_timezone(&Utc);
+    let secs = dt.timestamp();
+    if secs < 0 {
+        return None;
+    }
+    SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs as u64, dt.timestamp_subsec_nanos()))
 }
 
 fn non_empty(v: &Option<String>) -> Option<String> {
@@ -143,8 +202,9 @@ pub fn scan_jsonl<R: BufRead>(reader: R) -> JsonlMeta {
         let need_ids = meta.session_id.is_none() || meta.cwd.is_none();
         let maybe_title = line.contains("-title") || line.contains("agent-name");
         let need_prompt = meta.first_prompt.is_none() && line.contains("\"user\"");
+        let need_timestamp = meta.timestamp.is_none() && line.contains("\"timestamp\"");
 
-        if !(need_ids || maybe_title || need_prompt) {
+        if !(need_ids || maybe_title || need_prompt || need_timestamp) {
             continue;
         }
 
@@ -172,6 +232,12 @@ pub fn scan_jsonl<R: BufRead>(reader: R) -> JsonlMeta {
         {
             meta.cwd = Some(s.to_string());
         }
+        if meta.timestamp.is_none()
+            && let Some(s) = obj.get("timestamp").and_then(Value::as_str)
+            && let Some(ts) = parse_timestamp(s)
+        {
+            meta.timestamp = Some(ts);
+        }
 
         match obj.get("type").and_then(Value::as_str) {
             // 複数回出るので、最後に出現した値で上書きする
@@ -195,7 +261,16 @@ pub fn scan_jsonl<R: BufRead>(reader: R) -> JsonlMeta {
                 if let Some(text) = content_text(content) {
                     let text = text.trim();
                     if !text.is_empty() {
-                        meta.first_prompt = Some(truncate_chars(text, PROMPT_LIMIT));
+                        if is_slash_command_text(text) {
+                            // スラッシュコマンド実行そのものは実質的な発言とみなさない。
+                            // 最後の手段用に command-name だけ (最初に見つかったもの) 覚えておき、
+                            // 次の (コマンド実行ではない) user メッセージを引き続き探す
+                            if meta.first_command_name.is_none() {
+                                meta.first_command_name = extract_command_name(text);
+                            }
+                        } else {
+                            meta.first_prompt = Some(truncate_chars(text, PROMPT_LIMIT));
+                        }
                     }
                 }
             }
@@ -455,6 +530,7 @@ mod tests {
             TitleKind::Ai,
             TitleKind::AgentName,
             TitleKind::FirstPrompt,
+            TitleKind::SlashCommand,
             TitleKind::None,
         ] {
             assert_eq!(TitleKind::from_tag(k.as_str()), k);
@@ -489,5 +565,209 @@ mod tests {
     fn ワンライン整形は空文字を返しうる() {
         assert_eq!(oneline_preview(&format!("  {THINKING_MARKER}  "), 40), "");
         assert_eq!(oneline_preview("", 40), "");
+    }
+
+    // ---- 機能3: timestamp ベースの作成日時 ----
+
+    /// テストの期待値を chrono 経由で作る (手計算での epoch 秒の書き間違いを避ける)。
+    fn expected_system_time(rfc3339: &str) -> SystemTime {
+        let dt = DateTime::parse_from_rfc3339(rfc3339).unwrap().with_timezone(&Utc);
+        SystemTime::UNIX_EPOCH + Duration::from_secs(dt.timestamp() as u64)
+    }
+
+    #[test]
+    fn timestampをパースして保持する() {
+        let jsonl = concat!(
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-07-25T10:00:00.000Z","message":{"role":"user","content":"質問"}}"#,
+            "\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(
+            m.timestamp,
+            Some(expected_system_time("2026-07-25T10:00:00.000Z"))
+        );
+    }
+
+    #[test]
+    fn timestampはオフセット付きでも解釈できる() {
+        // +09:00 の 19:00 は UTC の 10:00 と同じ瞬間
+        let jsonl = concat!(
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-07-25T19:00:00+09:00","message":{"role":"user","content":"質問"}}"#,
+            "\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(
+            m.timestamp,
+            Some(expected_system_time("2026-07-25T10:00:00.000Z"))
+        );
+    }
+
+    #[test]
+    fn timestampは最初に見つかった行の値を使う() {
+        // cwd/session_id と同じく、先頭行に無くても最初に見つかった値を使う
+        let jsonl = concat!(
+            r#"{"type":"summary","sessionId":"s"}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-01-01T00:00:00.000Z","message":{"role":"user","content":"a"}}"#,
+            "\n",
+            r#"{"type":"user","sessionId":"s","timestamp":"2026-02-02T00:00:00.000Z","message":{"role":"user","content":"b"}}"#,
+            "\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(
+            m.timestamp,
+            Some(expected_system_time("2026-01-01T00:00:00.000Z"))
+        );
+    }
+
+    #[test]
+    fn 壊れたtimestamp文字列は無視する() {
+        let jsonl = concat!(
+            r#"{"type":"user","sessionId":"s","timestamp":"そもそも日付ではない","message":{"role":"user","content":"a"}}"#,
+            "\n",
+        );
+        assert_eq!(scan(jsonl).timestamp, None);
+    }
+
+    #[test]
+    fn timestampキーが無ければNone() {
+        let jsonl = "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"a\"}}\n";
+        assert_eq!(scan(jsonl).timestamp, None);
+    }
+
+    #[test]
+    fn 空ファイルのtimestampはNone() {
+        assert_eq!(scan("").timestamp, None);
+    }
+
+    // ---- 機能5: スラッシュコマンド実行をタイトルフォールバックから除外 ----
+
+    #[test]
+    fn コマンド実行だけのメッセージはタイトルに使わず次を探す() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-name>/kibela-reflect</command-name>\\n",
+            "            <command-message>kibela-reflect</command-message>\\n",
+            "            <command-args>76377</command-args>",
+            "\"}}\n",
+            r#"{"type":"user","sessionId":"s","message":{"role":"user","content":"WAFの調査をしたい"}}"#,
+            "\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_prompt.as_deref(), Some("WAFの調査をしたい"));
+        assert_eq!(
+            m.title(),
+            ("WAFの調査をしたい".to_string(), TitleKind::FirstPrompt)
+        );
+        // 最後の手段用の command-name も (使われないが) 拾ってはいる
+        assert_eq!(m.first_command_name.as_deref(), Some("/kibela-reflect"));
+    }
+
+    #[test]
+    fn 全てコマンド実行のみのセッションはcommand_nameを最後の手段にする() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-name>/kibela-reflect</command-name>\\n",
+            "            <command-message>kibela-reflect</command-message>\\n",
+            "            <command-args>76377</command-args>",
+            "\"}}\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_prompt, None);
+        assert_eq!(
+            m.title(),
+            ("/kibela-reflect".to_string(), TitleKind::SlashCommand)
+        );
+    }
+
+    #[test]
+    fn コマンドタグの順序が前後しても判定できる() {
+        // command-message / command-args が command-name より先に出現するケース
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-args>76377</command-args>",
+            "<command-message>kibela-reflect</command-message>",
+            "<command-name>/kibela-reflect</command-name>",
+            "\"}}\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_prompt, None);
+        assert_eq!(m.first_command_name.as_deref(), Some("/kibela-reflect"));
+        assert_eq!(
+            m.title(),
+            ("/kibela-reflect".to_string(), TitleKind::SlashCommand)
+        );
+    }
+
+    #[test]
+    fn command_nameが他のタグに入れ子になっていても判定できる() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<local-command-stdout><command-name>/foo</command-name>",
+            "<command-message>foo</command-message></local-command-stdout>",
+            "\"}}\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_prompt, None);
+        assert_eq!(m.first_command_name.as_deref(), Some("/foo"));
+    }
+
+    #[test]
+    fn command_messageのみでcommand_nameが無ければコマンド実行として除外するが最後の手段は取れない() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-message>kibela-reflect</command-message>",
+            "\"}}\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_prompt, None, "コマンド実行はfirst_promptに使わない");
+        assert_eq!(m.first_command_name, None, "command-nameタグが無いので取れない");
+        assert_eq!(m.title(), (UNTITLED.to_string(), TitleKind::None));
+    }
+
+    #[test]
+    fn command_nameタグの中身が空なら最後の手段にも使えない() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-name></command-name><command-message>x</command-message>",
+            "\"}}\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_command_name, None);
+        assert_eq!(m.title(), (UNTITLED.to_string(), TitleKind::None));
+    }
+
+    #[test]
+    fn 閉じタグの無いcommand_nameは抽出できないが検出はされる() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-name>/foo",
+            "\"}}\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_prompt, None, "壊れていてもコマンド実行として除外する");
+        assert_eq!(m.first_command_name, None, "閉じタグが無いので中身は取れない");
+    }
+
+    #[test]
+    fn 最初に見つかったcommand_nameを最後の手段に使う() {
+        let jsonl = concat!(
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-name>/first</command-name>",
+            "\"}}\n",
+            "{\"type\":\"user\",\"sessionId\":\"s\",\"message\":{\"role\":\"user\",\"content\":\"",
+            "<command-name>/second</command-name>",
+            "\"}}\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.first_command_name.as_deref(), Some("/first"));
+    }
+
+    #[test]
+    fn タイトル種別にslash_commandが往復する() {
+        assert_eq!(
+            TitleKind::from_tag(TitleKind::SlashCommand.as_str()),
+            TitleKind::SlashCommand
+        );
     }
 }
