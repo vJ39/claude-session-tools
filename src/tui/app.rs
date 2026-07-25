@@ -281,7 +281,7 @@ impl App {
                         .unwrap_or_default();
                     self.mode = Mode::Input {
                         kind: InputKind::ResumeCwd,
-                        prompt: "resume する cwd (Enter で確定・jsonl は書き換えない)".to_string(),
+                        prompt: "resume する cwd".to_string(),
                         buffer,
                     };
                     Effect::None

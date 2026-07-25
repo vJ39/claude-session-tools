@@ -132,11 +132,15 @@ pub fn draw(frame: &mut Frame, app: &App, state: &mut TableState) {
     draw_query(frame, areas[0], app);
     draw_table(frame, areas[1], app, state);
     draw_detail(frame, areas[2], app);
-    draw_status(frame, areas[3], app);
+    let cursor = draw_status(frame, areas[3], app);
 
-    // ヘルプは一覧の上に重ねて出す (機能5)
+    // ヘルプは一覧の上に重ねて出す (機能5)。
+    // 入力中 (^w の cwd 指定など) はテキストカーソルを末尾に出す。
+    // ヘルプと入力は同時に立たないので分岐でよい。
     if app.mode == Mode::Help {
         draw_help(frame);
+    } else if let Some((x, y)) = cursor {
+        frame.set_cursor_position((x, y));
     }
 }
 
@@ -232,27 +236,69 @@ fn draw_detail(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn draw_status(frame: &mut Frame, area: Rect, app: &App) {
-    let (text, style) = match &app.mode {
+/// 文字列の端末表示幅 (全角=2)。ratatui の `Line::width()` と同じ算出。
+fn display_width(s: &str) -> usize {
+    Line::from(s).width()
+}
+
+/// 入力欄の見え方を決める。返り値は (実際に描く文字列, カーソルの桁位置)。
+///
+/// 入力は末尾追記・末尾削除のみなのでカーソルは常に buffer の末尾。
+/// `prompt: buffer` が幅を超えたら、末尾 (カーソル) が必ず見えるよう左を削る。
+fn input_view(prompt: &str, buffer: &str, width: usize) -> (String, usize) {
+    let head = format!("{prompt}: ");
+    let full = format!("{head}{buffer}");
+    let full_w = display_width(&full);
+
+    // 収まるならそのまま。カーソルは末尾の次の桁。
+    if width == 0 || full_w < width {
+        return (full, full_w);
+    }
+
+    // 溢れる分だけ左端から 1 文字ずつ落として末尾を見せる。
+    // カーソルは右端の 1 つ内側 (width-1) に置く。
+    let mut chars: Vec<char> = full.chars().collect();
+    while display_width(&chars.iter().collect::<String>()) > width.saturating_sub(1) {
+        if chars.is_empty() {
+            break;
+        }
+        chars.remove(0);
+    }
+    let shown: String = chars.iter().collect();
+    let cursor = display_width(&shown);
+    (shown, cursor)
+}
+
+/// ステータス行を描く。入力中はカーソルの絶対座標 (col,row) を返す。
+fn draw_status(frame: &mut Frame, area: Rect, app: &App) -> Option<(u16, u16)> {
+    let (text, style, cursor) = match &app.mode {
         Mode::Confirm { message, .. } => (
             message.clone(),
             Style::default().fg(Color::Black).bg(Color::Yellow),
+            None,
         ),
-        Mode::Input { prompt, buffer, .. } => (
-            format!("{prompt}: {buffer}"),
-            Style::default().fg(Color::Black).bg(Color::Cyan),
-        ),
+        Mode::Input { prompt, buffer, .. } => {
+            let (shown, col) = input_view(prompt, buffer, area.width as usize);
+            let x = area.x + col.min(area.width.saturating_sub(1) as usize) as u16;
+            (
+                shown,
+                Style::default().fg(Color::Black).bg(Color::Cyan),
+                Some((x, area.y)),
+            )
+        }
         Mode::Normal => match &app.status {
-            Some(s) => (s.clone(), Style::default().fg(Color::Yellow)),
-            None => (HELP.to_string(), Style::default().fg(Color::DarkGray)),
+            Some(s) => (s.clone(), Style::default().fg(Color::Yellow), None),
+            None => (HELP.to_string(), Style::default().fg(Color::DarkGray), None),
         },
         // ヘルプ表示中はステータス行にも案内を出す
         Mode::Help => (
             "任意のキーで閉じる".to_string(),
             Style::default().fg(Color::DarkGray),
+            None,
         ),
     };
     frame.render_widget(Paragraph::new(Line::from(text)).style(style), area);
+    cursor
 }
 
 #[cfg(test)]
@@ -522,5 +568,80 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();
         let mut state = TableState::default();
         terminal.draw(|f| draw(f, &app, &mut state)).unwrap();
+    }
+
+    #[test]
+    fn 全角の表示幅を数える() {
+        assert_eq!(display_width("abc"), 3);
+        assert_eq!(display_width("あいう"), 6);
+        assert_eq!(display_width("cwd あ"), 6);
+    }
+
+    #[test]
+    fn 入力が収まればそのまま出しカーソルは末尾() {
+        let (shown, col) = input_view("cwd", "/tmp", 80);
+        assert_eq!(shown, "cwd: /tmp");
+        // "cwd: /tmp" は 9 桁。カーソルはその次 (末尾入力位置)
+        assert_eq!(col, 9);
+    }
+
+    #[test]
+    fn 空入力でもプロンプトの後ろにカーソルが出る() {
+        let (shown, col) = input_view("内容検索", "", 80);
+        assert_eq!(shown, "内容検索: ");
+        // 全角4文字(8) + ": "(2) = 10
+        assert_eq!(col, 10);
+    }
+
+    #[test]
+    fn 長い入力は末尾が見えるよう左を削りカーソルは右端内側() {
+        // 幅 10 に収まらない長いパス。末尾 (最後に打った文字) が必ず見える
+        let (shown, col) = input_view("cwd", "/very/long/path/to/dir", 10);
+        assert!(display_width(&shown) <= 10);
+        assert!(shown.ends_with("dir"), "末尾が見えていない: {shown:?}");
+        assert!(col <= 9, "カーソルが右端を越える: {col}");
+    }
+
+    #[test]
+    fn 入力モードではテキストカーソルが立つ() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use crate::tui::app::{InputKind, Mode};
+
+        let mut app = App::new(vec![build_row(false, vec![])]);
+        app.mode = Mode::Input {
+            kind: InputKind::ResumeCwd,
+            prompt: "resume する cwd".to_string(),
+            buffer: "/tmp".to_string(),
+        };
+        // Frame は Terminal 経由でしか作れないので closure の中で draw_status を検証する。
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 5, 120, 1);
+                let cursor = draw_status(f, area, &app);
+                let (x, y) = cursor.expect("入力中はカーソルが出るはず");
+                assert_eq!(y, 5, "カーソルはステータス行の y に置かれる");
+                // "resume する cwd: /tmp" の末尾。全角4 + "する cwd: /tmp"
+                assert!(x > area.x, "カーソルが左端のまま");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn 通常モードではカーソルを出さない() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+
+        let app = App::new(vec![build_row(false, vec![])]);
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = Rect::new(0, 5, 120, 1);
+                assert!(draw_status(f, area, &app).is_none(), "通常モードでカーソルが出ている");
+            })
+            .unwrap();
     }
 }
