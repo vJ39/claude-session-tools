@@ -1,0 +1,36 @@
+[package]
+name = "cst"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+# TLS は aws-lc ではなく ring を使う。aws-lc-sys は環境の CC (gcc) 指定で
+# ビルドが壊れるため、HTTP クライアントを明示的に組み立てて差し込む。
+aws-config = { version = "1.10.1", default-features = false, features = [
+    "behavior-version-latest",
+    "rt-tokio",
+    "credentials-process",
+    "sso",
+] }
+aws-sdk-s3 = { version = "1.140.0", default-features = false, features = [
+    "behavior-version-latest",
+    "sigv4a",
+    "http-1x",
+    "rt-tokio",
+] }
+aws-smithy-http-client = { version = "1.2.0", features = ["rustls-ring"] }
+chrono = "0.4.45"
+clap = { version = "4.6.4", features = ["derive"] }
+filetime = "0.2.29"
+nucleo = "0.5.0"
+ratatui = "0.30.2"
+rusqlite = { version = "0.37", features = ["bundled"] }
+serde = "1.0.229"
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "fs", "sync"] }
+uuid = { version = "1.24.0", features = ["v4"] }
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.27.0"

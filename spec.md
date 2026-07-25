@@ -2,7 +2,7 @@
 
 `~/.claude/projects/` 配下に61プロジェクト・3672セッション(3.1GB)が溜まっており、どのセッションが何をやっていたか一覧で追えない。fzf風のインクリメンタルセレクタで一覧・検索・操作できるCUIツールをRustで作る。
 
-既存の `merge-session.py`(セッション統合)・`sync-to-s3.sh`(S3バックアップ)とは目的が異なる(あちらはマージ・退避、今回は日常的な一覧・選択・操作)。同一リポジトリに併存させ、将来的な統合は今回のスコープ外とする。
+既存の `merge-session.py`(セッション統合)・`sync-to-s3.sh`(S3バックアップ)も同一バイナリのサブコマンドとしてRustへ移植し、リポジトリ全体をRust製CLIに統一する。
 
 ## データソース
 
@@ -63,12 +63,14 @@ CREATE TABLE work_log (
 1セッション1行、以下の列を表示する:
 
 - session id(先頭8桁で表示、フルIDは詳細表示や操作時に使う)
-- タイトル(custom-title優先、無ければai-title、両方無ければ`(無題)`)
+- タイトル(custom-title優先、無ければai-title、両方無ければ最初のuserメッセージ冒頭を表示、それも取得できなければ`(無題)`)
 - 紐づくRedmineチケット番号(タイトル/タスクsubjectから抽出、複数あれば全部)
 - タスク数: `pending` / `in_progress` / `done` の内訳
 - 作成日時(jsonlファイルのbirthtime)
 
 デフォルトは作成日時降順。
+
+既定では`isSidechain: true`のサブエージェント記録(`<sessionId>/subagents/agent-*.jsonl`)を一覧から除外し、本体セッションのみ表示する。TUI起動中はキー操作でサブエージェント記録の表示/非表示をその場でトグルできる(既存のキーバインドと衝突しないキーを割り当てる)。起動時の初期状態はCLIオプション`--include-subagents`でも指定できる。
 
 ### 操作
 
@@ -79,22 +81,46 @@ CREATE TABLE work_log (
 - **分類・タグ付け**: ツール側の別ストア(sqlite等)に手動タグを保存する。jsonl自体は編集しない
 - **要約・recap**: 選択したセッションに対し `claude --resume <sessionId> -p "<要約prompt>" --model <軽量モデル>` をサブプロセスとして呼び出し、結果を表示する。Rust側でAnthropic API鍵を直接扱わず、既存のclaude CLI認証をそのまま使う
 
+### merge-session.pyの移植(サブコマンド化)
+
+既存Python版の挙動をそのまま踏襲する。
+
+- コマンド: `<bin> merge <session_a.jsonl> <session_b.jsonl> [--append] [--dry-run]`
+- セッションBのuser/assistantメッセージを抽出し、UUID/parentUuid/sessionIdを再採番してセッションAへ挿入する
+  - デフォルト: セッションAの先頭(最初のuserメッセージの前)に挿入
+  - `--append`: セッションAの末尾(最後のuser/assistantメッセージの後)に追加
+- `--dry-run`: 書き込まずマージ後の件数・会話プレビュー(先頭10件)のみ表示
+- 実行時は上書き前に`<session_a_path>.bak.<YYYYMMDDHHMMSS>`へバックアップする
+- 完了後「`claude --resume <session_id>`して`/compact`」の案内を表示する
+
+### sync-to-s3.shの移植(サブコマンド化)
+
+既存Shell版の挙動をそのまま踏襲する。cron実行前提でネットワーク断時も非エラー終了する。
+
+- コマンド: `<bin> sync-s3`
+- `AWS_PROFILE=test`でバケット`yotsuya-test`への疎通確認(head-bucket、タイムアウト5秒)。失敗時は何もせず正常終了(exit 0)
+- 疎通OKなら`~/.claude/projects/`を`s3://yotsuya-test/claude-sessions/projects/`へsync(`--exclude *.lock`・`--size-only`・エラー時のみ出力)
+- AWS認証はaws-sdk-s3 + aws-configで環境変数`AWS_PROFILE`をそのまま利用する(鍵をRust側にハードコードしない)
+
 ## 技術選定
 
 - 言語: Rust
+- CLI: `clap`(derive)。サブコマンド無し実行でTUI起動、`merge`/`sync-s3`をサブコマンドとして提供
 - TUI: `ratatui`
 - fuzzy matcher: `nucleo`(helixが採用しているインクリメンタルマッチャー。`skim`ライブラリでも可、実装時に比較して選定)
 - jsonl parse: `serde_json`(1行ずつstreaming読み込み。3672ファイル×可変行数のため全文を一度にメモリへ載せない)
 - SQLite読み取り: `rusqlite`
 - ファイル探索: `walkdir`
+- 非同期ランタイム: `tokio`(aws-sdk-s3が非同期APIのため。TUI/merge部分は同期のままでよい)
+- S3: `aws-sdk-s3` / `aws-config`
 
 ## スコープ
 
 - 対象: `~/.claude/projects/` 配下の全プロジェクト横断
 - 既存のtodo運用・スキル(y-find-session、todo自動キャプチャ等)とは完全独立。将来連携したくなったら拡張する
+- リポジトリ内の`merge-session.py`・`sync-to-s3.sh`はRust版と同一挙動になったら削除する
 
 ## 非対象(今回のスコープ外)
 
-- merge-session.py/sync-to-s3.shとの統合・Rust化
 - todo.md/journalとの連携
 - タスクの新規作成・編集(閲覧のみ)
