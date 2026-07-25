@@ -100,13 +100,14 @@ pub fn header_line(app: &App) -> String {
 pub const HELP: &str = "Enter:resume  ^w:cwd指定resume  ^g:内容検索  ^t:タグ  ^d:削除  ^a:アーカイブ  ?:ヘルプ  Esc:戻る/終了";
 
 /// `?` で開くヘルプオーバーレイの中身 (機能5)。1 行 1 ショートカット。
-pub const HELP_LINES: [&str; 15] = [
+pub const HELP_LINES: [&str; 16] = [
     "cst セッションブラウザ ― ショートカット",
     "",
     "  Enter        選択セッションを resume (cwd が消えていると不可)",
     "  ^w           cwd を一時指定して resume (jsonl は書き換えない)",
     "  ↑/↓ ^p/^n    カーソル移動      PgUp/PgDn 10 行  Home/End 端へ",
     "  文字入力      タイトル/ID/cwd/チケット/タグを fuzzy 絞り込み",
+    "  入力欄        ←→ で移動  Home/End 端へ  Del 削除  ^a/^e 行頭/行末",
     "  ^u           クエリ/入力をクリア",
     "  ^g           jsonl 全文検索 (内容検索)",
     "  ^t           タグ付け (空 Enter で全解除)",
@@ -146,7 +147,7 @@ pub fn draw(frame: &mut Frame, app: &App, state: &mut TableState) {
 
 /// ヘルプオーバーレイを画面中央に重ねて描く (機能5)。
 fn draw_help(frame: &mut Frame) {
-    let area = centered_rect(frame.area(), HELP_LINES);
+    let area = centered_rect(frame.area(), &HELP_LINES);
     let text: Vec<Line> = HELP_LINES.iter().map(|l| Line::from(*l)).collect();
     let block = Block::default()
         .borders(Borders::ALL)
@@ -158,7 +159,7 @@ fn draw_help(frame: &mut Frame) {
 }
 
 /// ヘルプ本文が収まる矩形を画面中央に作る。画面が小さければ全面に丸める。
-fn centered_rect(full: Rect, lines: [&str; 15]) -> Rect {
+fn centered_rect(full: Rect, lines: &[&str]) -> Rect {
     // 罫線 + 左右の余白を見込んだ幅・高さ
     let content_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0) as u16;
     let want_w = (content_w + 4).min(full.width);
@@ -243,30 +244,55 @@ fn display_width(s: &str) -> usize {
 
 /// 入力欄の見え方を決める。返り値は (実際に描く文字列, カーソルの桁位置)。
 ///
-/// 入力は末尾追記・末尾削除のみなのでカーソルは常に buffer の末尾。
-/// `prompt: buffer` が幅を超えたら、末尾 (カーソル) が必ず見えるよう左を削る。
-fn input_view(prompt: &str, buffer: &str, width: usize) -> (String, usize) {
+/// `cursor` は buffer 内のカーソル文字位置 (0..=文字数)。
+/// `prompt: ` は常に左端に固定し、buffer 部分だけを横スクロールさせて
+/// カーソルが可視域に入るようにする。全角は 2 桁として数える。
+fn input_view(prompt: &str, buffer: &str, cursor: usize, width: usize) -> (String, usize) {
     let head = format!("{prompt}: ");
-    let full = format!("{head}{buffer}");
-    let full_w = display_width(&full);
+    let head_w = display_width(&head);
+    let chars: Vec<char> = buffer.chars().collect();
 
-    // 収まるならそのまま。カーソルは末尾の次の桁。
-    if width == 0 || full_w < width {
-        return (full, full_w);
+    // buffer 部分に割ける桁数。prompt で使い切っていたら最低 1 桁は残す。
+    let avail = width.saturating_sub(head_w).max(1);
+
+    // カーソルまでの buffer 表示幅 (先頭からカーソル位置まで)。
+    let cursor_w = display_width(&chars[..cursor.min(chars.len())].iter().collect::<String>());
+    let total_w = display_width(buffer);
+
+    // 全部収まるならスクロールしない。
+    if width == 0 || head_w + total_w < width {
+        return (format!("{head}{buffer}"), head_w + cursor_w);
     }
 
-    // 溢れる分だけ左端から 1 文字ずつ落として末尾を見せる。
-    // カーソルは右端の 1 つ内側 (width-1) に置く。
-    let mut chars: Vec<char> = full.chars().collect();
-    while display_width(&chars.iter().collect::<String>()) > width.saturating_sub(1) {
-        if chars.is_empty() {
+    // カーソルが可視域 (avail-1 桁ぶん) に収まるよう、buffer の表示開始桁 off を決める。
+    // カーソルは右端の 1 つ内側までに収める。
+    let visible = avail.saturating_sub(1).max(1);
+    let off = cursor_w.saturating_sub(visible);
+
+    // off 桁ぶん左を捨てた buffer を作る (文字境界・全角を尊重)。
+    let mut skipped = 0;
+    let mut start = 0;
+    for (i, c) in chars.iter().enumerate() {
+        if skipped >= off {
+            start = i;
             break;
         }
-        chars.remove(0);
+        skipped += display_width(&c.to_string());
+        start = i + 1;
     }
-    let shown: String = chars.iter().collect();
-    let cursor = display_width(&shown);
-    (shown, cursor)
+    // 右端は avail 桁で切る。
+    let mut shown = String::new();
+    let mut w = 0;
+    for c in &chars[start..] {
+        let cw = display_width(&c.to_string());
+        if w + cw > avail {
+            break;
+        }
+        shown.push(*c);
+        w += cw;
+    }
+    let cursor_col = head_w + cursor_w.saturating_sub(skipped);
+    (format!("{head}{shown}"), cursor_col)
 }
 
 /// ステータス行を描く。入力中はカーソルの絶対座標 (col,row) を返す。
@@ -277,8 +303,8 @@ fn draw_status(frame: &mut Frame, area: Rect, app: &App) -> Option<(u16, u16)> {
             Style::default().fg(Color::Black).bg(Color::Yellow),
             None,
         ),
-        Mode::Input { prompt, buffer, .. } => {
-            let (shown, col) = input_view(prompt, buffer, area.width as usize);
+        Mode::Input { prompt, input, .. } => {
+            let (shown, col) = input_view(prompt, &input.buffer, input.cursor, area.width as usize);
             let x = area.x + col.min(area.width.saturating_sub(1) as usize) as u16;
             (
                 shown,
@@ -579,7 +605,8 @@ mod tests {
 
     #[test]
     fn 入力が収まればそのまま出しカーソルは末尾() {
-        let (shown, col) = input_view("cwd", "/tmp", 80);
+        // カーソルは末尾 (4 文字目の後ろ)
+        let (shown, col) = input_view("cwd", "/tmp", 4, 80);
         assert_eq!(shown, "cwd: /tmp");
         // "cwd: /tmp" は 9 桁。カーソルはその次 (末尾入力位置)
         assert_eq!(col, 9);
@@ -587,19 +614,51 @@ mod tests {
 
     #[test]
     fn 空入力でもプロンプトの後ろにカーソルが出る() {
-        let (shown, col) = input_view("内容検索", "", 80);
+        let (shown, col) = input_view("内容検索", "", 0, 80);
         assert_eq!(shown, "内容検索: ");
         // 全角4文字(8) + ": "(2) = 10
         assert_eq!(col, 10);
     }
 
     #[test]
-    fn 長い入力は末尾が見えるよう左を削りカーソルは右端内側() {
-        // 幅 10 に収まらない長いパス。末尾 (最後に打った文字) が必ず見える
-        let (shown, col) = input_view("cwd", "/very/long/path/to/dir", 10);
+    fn 途中カーソルはその桁を指す() {
+        // "cwd: /tmp" でカーソルを先頭 (buffer index 0) に置く
+        let (shown, col) = input_view("cwd", "/tmp", 0, 80);
+        assert_eq!(shown, "cwd: /tmp");
+        // "cwd: " は 5 桁。buffer 先頭なのでカーソルは 5
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn 長い入力で末尾カーソルなら末尾が見える() {
+        // 幅 10 に収まらない長いパス。カーソル末尾なら末尾が見える
+        let buf = "/very/long/path/to/dir";
+        let (shown, col) = input_view("cwd", buf, buf.chars().count(), 10);
         assert!(display_width(&shown) <= 10);
         assert!(shown.ends_with("dir"), "末尾が見えていない: {shown:?}");
         assert!(col <= 9, "カーソルが右端を越える: {col}");
+    }
+
+    #[test]
+    fn 長い入力で先頭カーソルなら先頭が見える() {
+        // カーソルが先頭にあるときは buffer 先頭が可視域に来る
+        let buf = "/very/long/path/to/dir";
+        let (shown, col) = input_view("cwd", buf, 0, 10);
+        assert!(display_width(&shown) <= 10);
+        // "cwd: " の直後 (buffer 先頭) を指す
+        assert_eq!(col, display_width("cwd: "));
+        assert!(shown.starts_with("cwd: /very"), "先頭が見えていない: {shown:?}");
+    }
+
+    #[test]
+    fn 全角混じりの長い入力で途中カーソルでも落ちない() {
+        // 全角がスクロール境界に絡んでもカーソル桁が underflow しない (saturating_sub の回帰)。
+        let buf = "あいうえお/かきくけこ/さしすせそ";
+        for cursor in 0..=buf.chars().count() {
+            let (shown, col) = input_view("cwd", buf, cursor, 10);
+            assert!(display_width(&shown) <= 10, "はみ出した: {shown:?}");
+            assert!(col <= 10, "カーソルが可視域を越える: cursor={cursor} col={col}");
+        }
     }
 
     #[test]
@@ -608,12 +667,13 @@ mod tests {
         use ratatui::backend::TestBackend;
         use ratatui::layout::Rect;
         use crate::tui::app::{InputKind, Mode};
+        use crate::tui::input::InputState;
 
         let mut app = App::new(vec![build_row(false, vec![])]);
         app.mode = Mode::Input {
             kind: InputKind::ResumeCwd,
             prompt: "resume する cwd".to_string(),
-            buffer: "/tmp".to_string(),
+            input: InputState::with_text("/tmp"),
         };
         // Frame は Terminal 経由でしか作れないので closure の中で draw_status を検証する。
         let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();

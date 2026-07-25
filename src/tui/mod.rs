@@ -4,6 +4,7 @@
 //! ここは「イベントを受けて App に渡し、返ってきた [`Effect`] を実行する」だけ。
 
 pub mod app;
+pub mod input;
 pub mod ui;
 
 use std::time::Duration;

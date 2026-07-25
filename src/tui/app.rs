@@ -8,6 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::filter::Filter;
 use crate::rows::SessionRow;
+use crate::tui::input::InputState;
 
 /// 確認ダイアログの種類。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -38,7 +39,7 @@ pub enum Mode {
     Input {
         kind: InputKind,
         prompt: String,
-        buffer: String,
+        input: InputState,
     },
     /// ショートカット一覧のオーバーレイ (機能5)
     Help,
@@ -210,7 +211,7 @@ impl App {
         match self.mode.clone() {
             Mode::Normal => self.on_key_normal(key),
             Mode::Confirm { kind, .. } => self.on_key_confirm(key, kind),
-            Mode::Input { kind, prompt, buffer } => self.on_key_input(key, kind, prompt, buffer),
+            Mode::Input { kind, prompt, input } => self.on_key_input(key, kind, prompt, input),
             Mode::Help => self.on_key_help(key),
         }
     }
@@ -250,7 +251,7 @@ impl App {
                     self.mode = Mode::Input {
                         kind: InputKind::Grep,
                         prompt: "内容検索".to_string(),
-                        buffer: String::new(),
+                        input: InputState::new(),
                     };
                     Effect::None
                 }
@@ -261,7 +262,7 @@ impl App {
                     self.mode = Mode::Input {
                         kind: InputKind::Tag,
                         prompt: "タグ (空 Enter で全解除)".to_string(),
-                        buffer: String::new(),
+                        input: InputState::new(),
                     };
                     Effect::None
                 }
@@ -275,14 +276,14 @@ impl App {
                     if self.selected_index().is_none() {
                         return Effect::None;
                     }
-                    let buffer = self
+                    let cwd = self
                         .selected()
                         .and_then(|r| r.cwd.clone())
                         .unwrap_or_default();
                     self.mode = Mode::Input {
                         kind: InputKind::ResumeCwd,
                         prompt: "resume する cwd".to_string(),
-                        buffer,
+                        input: InputState::with_text(cwd),
                     };
                     Effect::None
                 }
@@ -403,19 +404,22 @@ impl App {
         key: KeyEvent,
         kind: InputKind,
         prompt: String,
-        mut buffer: String,
+        mut input: InputState,
     ) -> Effect {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        if ctrl && key.code == KeyCode::Char('u') {
-            self.mode = Mode::Input {
-                kind,
-                prompt,
-                buffer: String::new(),
-            };
-            return Effect::None;
-        }
-        if ctrl && key.code == KeyCode::Char('c') {
-            self.mode = Mode::Normal;
+        if ctrl {
+            match key.code {
+                // ^u で全消去、^a/^e で行頭/行末 (Emacs 風)
+                KeyCode::Char('u') => input.clear(),
+                KeyCode::Char('a') => input.home(),
+                KeyCode::Char('e') => input.end(),
+                KeyCode::Char('c') => {
+                    self.mode = Mode::Normal;
+                    return Effect::None;
+                }
+                _ => {}
+            }
+            self.mode = Mode::Input { kind, prompt, input };
             return Effect::None;
         }
 
@@ -426,7 +430,7 @@ impl App {
             }
             KeyCode::Enter => {
                 self.mode = Mode::Normal;
-                let text = buffer.trim().to_string();
+                let text = input.trimmed();
                 match kind {
                     InputKind::Grep => {
                         if text.is_empty() {
@@ -450,14 +454,39 @@ impl App {
                     },
                 }
             }
+            KeyCode::Left => {
+                input.left();
+                self.mode = Mode::Input { kind, prompt, input };
+                Effect::None
+            }
+            KeyCode::Right => {
+                input.right();
+                self.mode = Mode::Input { kind, prompt, input };
+                Effect::None
+            }
+            KeyCode::Home => {
+                input.home();
+                self.mode = Mode::Input { kind, prompt, input };
+                Effect::None
+            }
+            KeyCode::End => {
+                input.end();
+                self.mode = Mode::Input { kind, prompt, input };
+                Effect::None
+            }
             KeyCode::Backspace => {
-                buffer.pop();
-                self.mode = Mode::Input { kind, prompt, buffer };
+                input.backspace();
+                self.mode = Mode::Input { kind, prompt, input };
+                Effect::None
+            }
+            KeyCode::Delete => {
+                input.delete();
+                self.mode = Mode::Input { kind, prompt, input };
                 Effect::None
             }
             KeyCode::Char(c) => {
-                buffer.push(c);
-                self.mode = Mode::Input { kind, prompt, buffer };
+                input.insert(c);
+                self.mode = Mode::Input { kind, prompt, input };
                 Effect::None
             }
             _ => Effect::None,
@@ -815,7 +844,7 @@ mod tests {
         }
         app.on_key(ctrl('u'));
         match &app.mode {
-            Mode::Input { buffer, .. } => assert_eq!(buffer, ""),
+            Mode::Input { input, .. } => assert_eq!(input.buffer, ""),
             other => panic!("入力モードのままのはず: {other:?}"),
         }
     }
@@ -828,9 +857,96 @@ mod tests {
         app.on_key(key('b'));
         app.on_key(code(KeyCode::Backspace));
         match &app.mode {
-            Mode::Input { buffer, .. } => assert_eq!(buffer, "a"),
+            Mode::Input { input, .. } => assert_eq!(input.buffer, "a"),
             other => panic!("入力モードのままのはず: {other:?}"),
         }
+    }
+
+    /// 入力モードの `InputState` を取り出す (テスト補助)。
+    fn input_of(app: &App) -> &InputState {
+        match &app.mode {
+            Mode::Input { input, .. } => input,
+            other => panic!("入力モードのままのはず: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn 左移動して途中に挿入できる() {
+        let mut app = app();
+        app.on_key(ctrl('g'));
+        for c in "ac".chars() {
+            app.on_key(key(c));
+        }
+        // カーソルを 'c' の前へ動かして 'b' を挿入
+        app.on_key(code(KeyCode::Left));
+        app.on_key(key('b'));
+        let input = input_of(&app);
+        assert_eq!(input.buffer, "abc");
+        assert_eq!(input.cursor, 2);
+    }
+
+    #[test]
+    fn 左移動してバックスペースはカーソル直前を消す() {
+        let mut app = app();
+        app.on_key(ctrl('g'));
+        for c in "abc".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(code(KeyCode::Left)); // 'c' の前
+        app.on_key(code(KeyCode::Backspace)); // 'b' を消す
+        assert_eq!(input_of(&app).buffer, "ac");
+    }
+
+    #[test]
+    fn deleteキーはカーソル位置を消す() {
+        let mut app = app();
+        app.on_key(ctrl('g'));
+        for c in "abc".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(code(KeyCode::Home)); // 先頭へ
+        app.on_key(code(KeyCode::Delete)); // 'a' を消す
+        let input = input_of(&app);
+        assert_eq!(input.buffer, "bc");
+        assert_eq!(input.cursor, 0);
+    }
+
+    #[test]
+    fn home_endで行頭行末に飛ぶ() {
+        let mut app = app();
+        app.on_key(ctrl('g'));
+        for c in "abcd".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(code(KeyCode::Home));
+        assert_eq!(input_of(&app).cursor, 0);
+        app.on_key(code(KeyCode::End));
+        assert_eq!(input_of(&app).cursor, 4);
+    }
+
+    #[test]
+    fn ctrl_a_eも行頭行末に飛ぶ() {
+        let mut app = app();
+        app.on_key(ctrl('g'));
+        for c in "abcd".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(ctrl('a'));
+        assert_eq!(input_of(&app).cursor, 0);
+        app.on_key(ctrl('e'));
+        assert_eq!(input_of(&app).cursor, 4);
+    }
+
+    #[test]
+    fn cwd上書きで途中編集してから確定できる() {
+        let mut app = app();
+        app.on_key(ctrl('w')); // 初期値 "/Users/work/.ghq/repo"、カーソル末尾
+        // 末尾に "/sub" を足す
+        for c in "/sub".chars() {
+            app.on_key(key(c));
+        }
+        let eff = app.on_key(code(KeyCode::Enter));
+        assert_eq!(eff, Effect::ResumeWithCwd(0, "/Users/work/.ghq/repo/sub".to_string()));
     }
 
     #[test]
@@ -883,9 +999,11 @@ mod tests {
         let mut app = app();
         assert_eq!(app.on_key(ctrl('w')), Effect::None);
         match &app.mode {
-            Mode::Input { kind, buffer, .. } => {
+            Mode::Input { kind, input, .. } => {
                 assert_eq!(*kind, InputKind::ResumeCwd);
-                assert_eq!(buffer, "/Users/work/.ghq/repo");
+                assert_eq!(input.buffer, "/Users/work/.ghq/repo");
+                // 初期値のカーソルは末尾
+                assert_eq!(input.cursor, input.len());
             }
             other => panic!("cwd 上書き入力になっていない: {other:?}"),
         }
