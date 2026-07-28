@@ -53,6 +53,13 @@ impl InputState {
         self.cursor += 1;
     }
 
+    /// カーソル位置に文字列をまとめて挿入する (貼り付け用)。カーソルは挿入した分だけ進む。
+    pub fn insert_str(&mut self, s: &str) {
+        let at = self.byte_at(self.cursor);
+        self.buffer.insert_str(at, s);
+        self.cursor += s.chars().count();
+    }
+
     /// カーソル直前の 1 文字を削除する (Backspace)。
     pub fn backspace(&mut self) {
         if self.cursor == 0 {
@@ -207,6 +214,15 @@ mod tests {
         assert_eq!(s.cursor, 2);
         s.backspace();
         assert_eq!(s.buffer, "あい");
+    }
+
+    #[test]
+    fn insert_strでまとめて挿入できる() {
+        let mut s = InputState::with_text("ac");
+        s.left(); // 'c' の前
+        s.insert_str("bb");
+        assert_eq!(s.buffer, "abbc");
+        assert_eq!(s.cursor, 3);
     }
 
     #[test]

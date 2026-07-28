@@ -20,6 +20,7 @@ cst --include-subagents   # サブエージェント記録も起動時から表�
 
 - 一覧: session id / タイトル(無ければ最初のuserメッセージ冒頭 / それも無ければ`(無題)`) / Redmineチケット番号 / タスク数(pending・in_progress・done) / 作成日時、作成日時降順
 - 既定ではサブエージェント記録(`<sessionId>/subagents/agent-*.jsonl`)を一覧から除外する
+- 検索(文字入力)はタイトル/セッションID(全体)/cwd/チケット番号/タグを対象にした fuzzy 絞り込み。セッションIDはそのまま貼り付けても検索できる
 
 操作キー:
 

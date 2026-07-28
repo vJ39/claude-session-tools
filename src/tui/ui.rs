@@ -100,13 +100,14 @@ pub fn header_line(app: &App) -> String {
 pub const HELP: &str = "Enter:resume  ^w:cwd指定resume  ^g:内容検索  ^t:タグ  ^d:削除  ^a:アーカイブ  ?:ヘルプ  Esc:戻る/終了";
 
 /// `?` で開くヘルプオーバーレイの中身 (機能5)。1 行 1 ショートカット。
-pub const HELP_LINES: [&str; 16] = [
+pub const HELP_LINES: [&str; 17] = [
     "cst セッションブラウザ ― ショートカット",
     "",
     "  Enter        選択セッションを resume (cwd が消えていると不可)",
     "  ^w           cwd を一時指定して resume (jsonl は書き換えない)",
     "  ↑/↓ ^p/^n    カーソル移動      PgUp/PgDn 10 行  Home/End 端へ",
-    "  文字入力      タイトル/ID/cwd/チケット/タグを fuzzy 絞り込み",
+    "  文字入力      タイトル/セッションID/cwd/チケット/タグを fuzzy 絞り込み",
+    "  貼り付け      セッションID等をそのまま貼り付け可 (クエリ/入力欄どちらも)",
     "  入力欄        ←→ で移動  Home/End 端へ  Del 削除  ^a/^e 行頭/行末",
     "  ^u           クエリ/入力をクリア",
     "  ^g           jsonl 全文検索 (内容検索)",

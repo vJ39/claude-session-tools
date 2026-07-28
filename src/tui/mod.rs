@@ -11,7 +11,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyEventKind};
+use ratatui::crossterm::execute;
 use ratatui::widgets::TableState;
 
 use crate::actions::{self, CommandSpec};
@@ -59,7 +60,11 @@ pub fn run(paths: &Paths, options: ScanOptions) -> Result<PostAction> {
     app.set_status(status_summary(&stats));
 
     let mut terminal = ratatui::init();
+    // セッションID等をまとめて貼り付けても検索できるよう bracketed paste を有効化する。
+    // 対応していない端末でも実害は無いので失敗は無視する。
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app, paths, &mut store, options);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -79,12 +84,14 @@ fn event_loop(
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let key = match event::read()? {
-            Event::Key(k) if k.kind == KeyEventKind::Press => k,
+        let ev = event::read()?;
+        let effect = match ev {
+            Event::Key(k) if k.kind == KeyEventKind::Press => app.on_key(k),
+            Event::Paste(text) => app.on_paste(&text),
             _ => continue,
         };
 
-        match app.on_key(key) {
+        match effect {
             Effect::None => {}
             Effect::Quit => return Ok(PostAction::None),
             Effect::Resume(index) => match actions::resume_command(&app.rows[index]) {
@@ -189,6 +196,7 @@ fn handle_recap(terminal: &mut DefaultTerminal, app: &mut App, index: usize) -> 
     let _ = std::io::stdin().read_line(&mut line);
 
     *terminal = ratatui::init();
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     terminal.clear()?;
     app.set_status("要約を表示した");
     Ok(())

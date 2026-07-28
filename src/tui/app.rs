@@ -216,6 +216,31 @@ impl App {
         }
     }
 
+    /// 貼り付け (ターミナルの bracketed paste) を処理する。
+    ///
+    /// クエリ/入力欄は 1 行のため、改行は取り除いて 1 行に詰めて挿入する
+    /// (セッションID を丸ごとペーストしても検索できるようにする狙い)。
+    pub fn on_paste(&mut self, text: &str) -> Effect {
+        let sanitized: String = text.chars().filter(|c| *c != '\n' && *c != '\r').collect();
+        if sanitized.is_empty() {
+            return Effect::None;
+        }
+        match self.mode.clone() {
+            Mode::Normal => {
+                self.query.push_str(&sanitized);
+                self.cursor = 0;
+                self.refilter();
+                Effect::None
+            }
+            Mode::Input { kind, prompt, mut input } => {
+                input.insert_str(&sanitized);
+                self.mode = Mode::Input { kind, prompt, input };
+                Effect::None
+            }
+            Mode::Confirm { .. } | Mode::Help => Effect::None,
+        }
+    }
+
     /// ヘルプ表示中のキー処理 (機能5)。^c だけ終了、それ以外の何かで閉じる。
     fn on_key_help(&mut self, key: KeyEvent) -> Effect {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1146,5 +1171,38 @@ mod tests {
         let mut app = app();
         app.remove_row(99);
         assert_eq!(app.counts(), (3, 3));
+    }
+
+    #[test]
+    fn 通常モードで貼り付けるとクエリに入り絞り込まれる() {
+        let mut app = app();
+        app.on_paste("cccc3333");
+        assert_eq!(app.query, "cccc3333");
+        assert_eq!(app.counts().0, 1);
+        assert_eq!(app.selected().unwrap().session_id, "cccc3333");
+    }
+
+    #[test]
+    fn 入力モードで貼り付けるとinputに入る() {
+        let mut app = app();
+        app.on_key(ctrl('g'));
+        app.on_paste("f8e16adc-dc64-42f1-8678-267768d68fb8");
+        let input = input_of(&app);
+        assert_eq!(input.buffer, "f8e16adc-dc64-42f1-8678-267768d68fb8");
+        assert_eq!(input.cursor, input.len());
+    }
+
+    #[test]
+    fn 貼り付けの改行は取り除いて1行に詰める() {
+        let mut app = app();
+        app.on_paste("cccc3333\nおまけの行");
+        assert_eq!(app.query, "cccc3333おまけの行");
+    }
+
+    #[test]
+    fn 空の貼り付けは何もしない() {
+        let mut app = app();
+        assert_eq!(app.on_paste(""), Effect::None);
+        assert!(app.query.is_empty());
     }
 }
