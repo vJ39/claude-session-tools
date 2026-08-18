@@ -3,8 +3,11 @@
 //! TUI のイベントループから切り離してあるので、実データを置いたディレクトリを
 //! 与えるだけでテストできる。
 
+use std::time::SystemTime;
+
 use anyhow::Result;
 
+use crate::fork;
 use crate::paths::Paths;
 use crate::rows::{self, SessionRow};
 use crate::scan::{self, ScanOptions, ScanStats};
@@ -39,7 +42,19 @@ pub fn load_with(
     let worklog = worklog::load(&paths.worklog_db());
     let tags = store.load_tags()?;
 
-    let rows = rows::build(sessions, &tasks, &running, &worklog, &tags);
+    // fork (resume による分岐) の起源判定には物理ファイルの birthtime を使う。
+    // build() が sessions の所有権を消費するので、その前に抜き出しておく
+    let birthtimes: Vec<(String, Option<SystemTime>)> = sessions
+        .iter()
+        .map(|s| (s.session_id.clone(), s.target.created))
+        .collect();
+
+    let mut rows = rows::build(sessions, &tasks, &running, &worklog, &tags);
+
+    let shared = store.shared_message_uuids()?;
+    let fork_groups = fork::detect_fork_groups(&shared, &birthtimes);
+    rows::apply_fork_marks(&mut rows, &fork_groups);
+
     Ok(Loaded { rows, stats })
 }
 
@@ -169,5 +184,81 @@ mod tests {
         let loaded = load(&paths, &mut store, None).unwrap();
         assert!(loaded.rows.is_empty());
         assert_eq!(loaded.stats.total, 0);
+    }
+
+    /// resume で分岐した (uuid を共有する) 2 セッションを実ファイルとして置く。
+    /// 先に作った方が birthtime が古くなるので起源になる。
+    fn setup_fork(root: &std::path::Path) -> Paths {
+        let paths = Paths::new(root.join("claude"), root.join("data"));
+        let proj = paths.projects().join("-Users-work--ghq-repo");
+        fs::create_dir_all(&proj).unwrap();
+
+        fs::write(
+            proj.join("sess-origin.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"sess-origin","cwd":"/Users/work/.ghq/repo","uuid":"shared-1","message":{"role":"user","content":"最初の質問"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        // birthtime を区別するため少し間を空けてから 2 本目を作る
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            proj.join("sess-child.jsonl"),
+            concat!(
+                r#"{"type":"user","sessionId":"sess-child","cwd":"/Users/work/.ghq/repo","uuid":"shared-1","message":{"role":"user","content":"最初の質問"}}"#,
+                "\n",
+                r#"{"type":"assistant","sessionId":"sess-child","uuid":"child-only","message":{"role":"assistant","content":"分岐後の返答"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        paths
+    }
+
+    #[test]
+    fn forkしたセッションに起源マークが付く() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = setup_fork(tmp.path());
+        let mut store = Store::open(&paths.store_db()).unwrap();
+
+        let loaded = load(&paths, &mut store, None).unwrap();
+        let origin = loaded.rows.iter().find(|r| r.session_id == "sess-origin").unwrap();
+        let child = loaded.rows.iter().find(|r| r.session_id == "sess-child").unwrap();
+
+        let origin_mark = origin.fork.as_ref().expect("起源セッションにも fork 情報が付くはず");
+        assert!(origin_mark.is_root);
+        assert_eq!(origin_mark.group_members, vec!["sess-child".to_string()]);
+
+        let child_mark = child.fork.as_ref().expect("分岐セッションに fork 情報が付くはず");
+        assert!(!child_mark.is_root);
+        assert_eq!(child_mark.group_members, vec!["sess-origin".to_string()]);
+    }
+
+    #[test]
+    fn forkしていないセッションはforkがNoneのまま() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = setup(tmp.path());
+        let mut store = Store::open(&paths.store_db()).unwrap();
+
+        let loaded = load(&paths, &mut store, None).unwrap();
+        assert!(loaded.rows.iter().all(|r| r.fork.is_none()));
+    }
+
+    #[test]
+    fn 二回目の読み込みでもfork情報がキャッシュ経由で保たれる() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = setup_fork(tmp.path());
+        let mut store = Store::open(&paths.store_db()).unwrap();
+
+        load(&paths, &mut store, None).unwrap();
+        // 2回目は session_cache がヒットして再走査されないが、message_uuid は
+        // 既に DB にあるので fork 判定は変わらず効くはず
+        let second = load(&paths, &mut store, None).unwrap();
+        assert_eq!(second.stats.parsed, 0, "2回目はキャッシュヒットで再走査されない");
+
+        let origin = second.rows.iter().find(|r| r.session_id == "sess-origin").unwrap();
+        assert!(origin.fork.as_ref().unwrap().is_root);
     }
 }

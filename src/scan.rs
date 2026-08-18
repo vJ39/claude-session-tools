@@ -12,7 +12,7 @@ use anyhow::Result;
 use walkdir::WalkDir;
 
 use crate::session::{JsonlMeta, TitleKind, scan_jsonl};
-use crate::store::{CachedSession, Store};
+use crate::store::{CachedSession, MessageUuidEntry, Store};
 
 /// jsonl の種別。
 ///
@@ -230,9 +230,14 @@ pub fn scan_all(
     // 更新分を並列に読む
     let fresh = parse_in_parallel(&targets, &todo, progress);
     let mut to_save: Vec<(String, CachedSession)> = Vec::with_capacity(fresh.len());
+    // fork 検出用の message uuid。session_id 単位で保存するため、jsonl 側に無ければ
+    // ファイル名 (from_cache と同じフォールバック) を使う
+    let mut uuid_to_save: Vec<MessageUuidEntry> = Vec::with_capacity(fresh.len());
     for (idx, meta) in fresh {
         let t = &targets[idx];
         let cached = CachedSession::from_meta(&meta, t.mtime_ns, t.size as i64);
+        let session_id = cached.session_id.clone().unwrap_or_else(|| t.file_stem.clone());
+        uuid_to_save.push((session_id, meta.message_uuids));
         to_save.push((t.path.to_string_lossy().to_string(), cached.clone()));
         results[idx] = Some(from_cache(t, &cached));
     }
@@ -241,7 +246,13 @@ pub fn scan_all(
         if !to_save.is_empty() {
             store.save_cache(&to_save)?;
         }
+        if !uuid_to_save.is_empty() {
+            store.save_message_uuids(&uuid_to_save)?;
+        }
         store.prune_cache(&on_disk)?;
+        let alive_session_ids: Vec<String> =
+            results.iter().flatten().map(|s| s.session_id.clone()).collect();
+        store.prune_message_uuids(&alive_session_ids)?;
     }
 
     Ok((results.into_iter().flatten().collect(), stats))

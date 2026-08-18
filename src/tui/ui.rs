@@ -19,12 +19,22 @@ const RUNNING_MARK: &str = "●";
 /// cwd が消えている (resume 不可) セッションに付ける印 (機能6)。
 const CWD_MISSING_MARK: &str = "✗";
 
+/// fork (resume による分岐) の起源セッションに付ける印。
+const FORK_ROOT_MARK: &str = "◆";
+/// fork で分岐した (起源ではない) セッションに付ける印。
+const FORK_CHILD_MARK: &str = "⑂";
+
 /// 1 行分のセル文字列を作る。
 pub fn row_cells(row: &SessionRow) -> [String; 6] {
+    let fork_mark = match &row.fork {
+        Some(f) if f.is_root => FORK_ROOT_MARK,
+        Some(_) => FORK_CHILD_MARK,
+        None => "",
+    };
     let id = if row.is_running() {
-        format!("{RUNNING_MARK}{}", row.short_id())
+        format!("{RUNNING_MARK}{fork_mark}{}", row.short_id())
     } else {
-        format!(" {}", row.short_id())
+        format!(" {fork_mark}{}", row.short_id())
     };
     let mut title = row.title.clone();
     if !row.tags.is_empty() {
@@ -56,6 +66,18 @@ pub fn detail_lines(row: &SessionRow) -> Vec<String> {
         Some(c) => c.clone(),
     };
     out.push(format!("{}  {}", row.session_id, cwd));
+
+    // resume で分岐した関連セッションがあれば件数だけ示す (機能: fork検出)。
+    // 個々のタイトル等は detail_lines が単一行しか見えないため出さない
+    if let Some(f) = &row.fork {
+        let n = f.group_members.len();
+        let line = if f.is_root {
+            format!("{FORK_ROOT_MARK} fork: このセッションが起源 (関連セッション {n} 件)")
+        } else {
+            format!("{FORK_CHILD_MARK} fork: resume による分岐 (同じ会話の関連セッション {n} 件)")
+        };
+        out.push(line);
+    }
 
     let mut meta = vec![
         format!("{} 行", row.line_count),
@@ -100,7 +122,7 @@ pub fn header_line(app: &App) -> String {
 pub const HELP: &str = "Enter:resume  ^w:cwd指定resume  ^g:内容検索  ^t:タグ  ^d:削除  ^a:アーカイブ  ?:ヘルプ  Esc:戻る/終了";
 
 /// `?` で開くヘルプオーバーレイの中身 (機能5)。1 行 1 ショートカット。
-pub const HELP_LINES: [&str; 17] = [
+pub const HELP_LINES: [&str; 18] = [
     "cst セッションブラウザ ― ショートカット",
     "",
     "  Enter        選択セッションを resume (cwd が消えていると不可)",
@@ -109,6 +131,7 @@ pub const HELP_LINES: [&str; 17] = [
     "  文字入力      タイトル/セッションID/cwd/チケット/タグを fuzzy 絞り込み",
     "  貼り付け      セッションID等をそのまま貼り付け可 (クエリ/入力欄どちらも)",
     "  入力欄        ←→ で移動  Home/End 端へ  Del 削除  ^a/^e 行頭/行末",
+    "  ◆/⑂          resume で分岐した関連セッション (◆起源 / ⑂分岐先。詳細は下部)",
     "  ^u           クエリ/入力をクリア",
     "  ^g           jsonl 全文検索 (内容検索)",
     "  ^t           タグ付け (空 Enter で全解除)",
@@ -451,6 +474,75 @@ mod tests {
         row.cwd_exists = false;
         let lines = detail_lines(&row);
         assert!(lines[0].contains("resume 不可"));
+    }
+
+    #[test]
+    fn forkが無ければID列に印が付かない() {
+        let cells = row_cells(&build_row(false, vec![]));
+        assert_eq!(cells[0], " aaaa1111", "fork マーク追加前と同じ表示のはず");
+    }
+
+    #[test]
+    fn fork起源セッションにはID列に起源マークが付く() {
+        let mut row = build_row(false, vec![]);
+        row.fork = Some(crate::rows::ForkMark {
+            is_root: true,
+            group_members: vec!["bbbb2222-3333".to_string()],
+        });
+        let cells = row_cells(&row);
+        assert_eq!(cells[0], format!(" {FORK_ROOT_MARK}aaaa1111"));
+    }
+
+    #[test]
+    fn fork分岐セッションにはID列に分岐マークが付く() {
+        let mut row = build_row(false, vec![]);
+        row.fork = Some(crate::rows::ForkMark {
+            is_root: false,
+            group_members: vec!["bbbb2222-3333".to_string()],
+        });
+        let cells = row_cells(&row);
+        assert_eq!(cells[0], format!(" {FORK_CHILD_MARK}aaaa1111"));
+    }
+
+    #[test]
+    fn 実行中とforkマークは両方出る() {
+        let mut row = build_row(true, vec![]);
+        row.fork = Some(crate::rows::ForkMark { is_root: true, group_members: vec![] });
+        let cells = row_cells(&row);
+        assert_eq!(cells[0], format!("{RUNNING_MARK}{FORK_ROOT_MARK}aaaa1111"));
+    }
+
+    #[test]
+    fn forkが無ければ詳細行にfork情報が出ない() {
+        let row = build_row(false, vec![]);
+        let lines = detail_lines(&row);
+        assert!(!lines.iter().any(|l| l.contains("fork:")));
+    }
+
+    #[test]
+    fn fork起源は詳細行に件数付きで出る() {
+        let mut row = build_row(false, vec![]);
+        row.fork = Some(crate::rows::ForkMark {
+            is_root: true,
+            group_members: vec!["b".to_string(), "c".to_string()],
+        });
+        let lines = detail_lines(&row);
+        let fork_line = lines.iter().find(|l| l.contains("fork:")).expect("fork行があるはず");
+        assert!(fork_line.contains("起源"));
+        assert!(fork_line.contains("2 件"));
+    }
+
+    #[test]
+    fn fork分岐は詳細行に起源への言及付きで出る() {
+        let mut row = build_row(false, vec![]);
+        row.fork = Some(crate::rows::ForkMark {
+            is_root: false,
+            group_members: vec!["origin1".to_string()],
+        });
+        let lines = detail_lines(&row);
+        let fork_line = lines.iter().find(|l| l.contains("fork:")).expect("fork行があるはず");
+        assert!(fork_line.contains("分岐"));
+        assert!(fork_line.contains("1 件"));
     }
 
     #[test]

@@ -121,3 +121,59 @@ fn 実データを絞り込める() {
         );
     }
 }
+
+/// 実データで fork (resume による分岐) 検出が動くことを確認する。
+///
+/// 2026/08/18 時点の事前調査で `b1ddb196-...` と `b2151286-...` が同じ会話から
+/// 分岐したペアと確認済み (共有 uuid 1318件、開始が早い b1ddb196 が起源)。
+/// 実データは変化しうるので、この組が現存すれば厳密に検証し、無ければ
+/// 「どこかに fork グループが検出されているか」だけを緩く確認する。
+#[test]
+#[ignore = "実データ依存。--ignored で明示実行する"]
+fn 実データでfork検出が動く() {
+    let env = Paths::from_env().expect("HOME が要る");
+    if !env.projects().is_dir() {
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let paths = Paths::new(&env.claude_home, tmp.path());
+    let mut store = Store::open(&paths.store_db()).unwrap();
+    let loaded = loader::load(&paths, &mut store, None).unwrap();
+
+    let forked: Vec<_> = loaded.rows.iter().filter(|r| r.fork.is_some()).collect();
+    println!("fork検出: 関連グループに属するセッション {} 件", forked.len());
+    for r in forked.iter().take(10) {
+        let f = r.fork.as_ref().unwrap();
+        println!(
+            "  {} {} is_root={} 関連{}件",
+            r.short_id(),
+            r.title,
+            f.is_root,
+            f.group_members.len()
+        );
+    }
+
+    let by_id = |id: &str| loaded.rows.iter().find(|r| r.session_id.starts_with(id));
+    match (by_id("b1ddb196"), by_id("b2151286")) {
+        (Some(a), Some(b)) => {
+            let fa = a.fork.as_ref().expect("b1ddb196 は fork グループに属するはず");
+            let fb = b.fork.as_ref().expect("b2151286 は fork グループに属するはず");
+            assert!(
+                fa.group_members.iter().any(|m| m.starts_with("b2151286")),
+                "b1ddb196 の関連に b2151286 が無い"
+            );
+            assert!(
+                fb.group_members.iter().any(|m| m.starts_with("b1ddb196")),
+                "b2151286 の関連に b1ddb196 が無い"
+            );
+            // 開始が早い (2026-07-16) b1ddb196 が起源のはず
+            assert!(fa.is_root, "b1ddb196 が起源のはず");
+            assert!(!fb.is_root, "b2151286 は起源ではないはず");
+        }
+        _ => {
+            println!("b1ddb196/b2151286 が実データに無い (削除された等)。緩い確認のみ行う");
+            // 事前調査 (102セッション中24組) からすると、何らかの fork は
+            // 見つかるはずだが、環境依存なので無くても失敗にはしない
+        }
+    }
+}

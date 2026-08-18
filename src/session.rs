@@ -2,6 +2,7 @@
 //!
 //! 3672 セッション (3.1GB) を横断するため、全行を `serde_json` に通すことはしない。
 //! 必要なキーを含む可能性がある行だけを部分的にパースする。
+//! ただし fork 検出用の uuid/timestamp だけは全行から (フルパースせず文字列抽出で) 集める。
 
 use std::io::BufRead;
 use std::time::{Duration, SystemTime};
@@ -96,6 +97,10 @@ pub struct JsonlMeta {
     pub line_count: u64,
     /// JSON として読めなかった行数
     pub parse_errors: u64,
+    /// 各行の `uuid` と `timestamp` (fork 検出用)。
+    /// `resume` で過去履歴ごとコピーされた別セッションは同じ uuid を持つメッセージが
+    /// 複数セッションにまたがって出現するため、これを手がかりに fork 元を特定する
+    pub message_uuids: Vec<(String, Option<SystemTime>)>,
 }
 
 impl JsonlMeta {
@@ -159,6 +164,19 @@ fn parse_timestamp(s: &str) -> Option<SystemTime> {
     SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs as u64, dt.timestamp_subsec_nanos()))
 }
 
+/// 行から `"key":"value"` 形式の文字列値を軽量に取り出す (JSON 全体はパースしない)。
+/// fork 検出用の uuid/timestamp 収集は全行に対して行うため、既存の他フィールド抽出
+/// (`serde_json::from_str` によるフルパース) を素通りする行にもコストを乗せないための措置。
+fn extract_str_field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    let mut needle = String::with_capacity(key.len() + 3);
+    needle.push('"');
+    needle.push_str(key);
+    needle.push_str("\":\"");
+    let start = line.find(needle.as_str())? + needle.len();
+    let end = line[start..].find('"')?;
+    Some(&line[start..start + end])
+}
+
 fn non_empty(v: &Option<String>) -> Option<String> {
     v.as_ref()
         .map(|s| s.trim().to_string())
@@ -198,6 +216,14 @@ pub fn scan_jsonl<R: BufRead>(reader: R) -> JsonlMeta {
             continue;
         }
         meta.line_count += 1;
+
+        // fork 検出用の uuid 収集は他フィールドの early-exit と無関係に全行へ行う。
+        // JSON フルパースは避け、軽量な文字列抽出だけで済ませる (実測: 984MB 全体で
+        // フルパースの半分程度の時間で済む)
+        if let Some(uuid) = extract_str_field(line, "uuid") {
+            let ts = extract_str_field(line, "timestamp").and_then(parse_timestamp);
+            meta.message_uuids.push((uuid.to_string(), ts));
+        }
 
         let need_ids = meta.session_id.is_none() || meta.cwd.is_none();
         let maybe_title = line.contains("-title") || line.contains("agent-name");
@@ -351,6 +377,10 @@ mod tests {
         assert_eq!(m.cwd.as_deref(), Some("/Users/work/repo"));
         assert_eq!(m.line_count, 3);
         assert_eq!(m.first_prompt.as_deref(), Some("最初の質問"));
+        assert_eq!(
+            m.message_uuids.iter().map(|(u, _)| u.as_str()).collect::<Vec<_>>(),
+            vec!["u1", "u2"]
+        );
         assert_eq!(m.title(), ("自動タイトル".to_string(), TitleKind::Ai));
     }
 
@@ -769,5 +799,45 @@ mod tests {
             TitleKind::from_tag(TitleKind::SlashCommand.as_str()),
             TitleKind::SlashCommand
         );
+    }
+
+    #[test]
+    fn uuidとtimestampを全行から集める() {
+        // fork 検出用の収集は、既存の早期終了 (session_id/cwd/title/first_prompt が
+        // 全部埋まった後) に関係なく全行に対して行われる。
+        let jsonl = concat!(
+            r#"{"type":"user","sessionId":"s","cwd":"/tmp","uuid":"u1","timestamp":"2026-07-16T06:37:18.172Z","message":{"role":"user","content":"質問"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","uuid":"u2","timestamp":"2026-07-16T06:40:00.000Z","message":{"role":"assistant","content":"回答"}}"#,
+            "\n",
+            r#"{"type":"assistant","sessionId":"s","uuid":"u3","message":{"role":"assistant","content":"timestampが無い行"}}"#,
+            "\n",
+        );
+        let m = scan(jsonl);
+        assert_eq!(m.message_uuids.len(), 3);
+        assert_eq!(m.message_uuids[0].0, "u1");
+        assert!(m.message_uuids[0].1.is_some());
+        assert_eq!(m.message_uuids[2].0, "u3");
+        assert_eq!(m.message_uuids[2].1, None, "timestampが無い行はNoneになる");
+    }
+
+    #[test]
+    fn uuidが無い行はmessage_uuidsに入らない() {
+        let jsonl = concat!(
+            r#"{"type":"custom-title","customTitle":"タイトル","sessionId":"s"}"#,
+            "\n",
+        );
+        let m = scan(jsonl);
+        assert!(m.message_uuids.is_empty());
+    }
+
+    #[test]
+    fn extract_str_fieldは対象キーの値だけを取り出す() {
+        assert_eq!(
+            extract_str_field(r#"{"a":"1","uuid":"abc-def","b":"2"}"#, "uuid"),
+            Some("abc-def")
+        );
+        assert_eq!(extract_str_field(r#"{"a":"1"}"#, "uuid"), None);
+        assert_eq!(extract_str_field(r#"{"uuidx":"1"}"#, "uuid"), None, "前方一致で誤検出しない");
     }
 }

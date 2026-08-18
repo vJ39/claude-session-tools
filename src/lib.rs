@@ -7,6 +7,7 @@
 pub mod actions;
 pub mod cli;
 pub mod filter;
+pub mod fork;
 pub mod grep;
 pub mod loader;
 pub mod merge;

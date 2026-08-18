@@ -8,6 +8,7 @@ use std::time::SystemTime;
 
 use chrono::{DateTime, Local};
 
+use crate::fork::ForkGroup;
 use crate::registry::RunningSession;
 use crate::scan::ScannedSession;
 use crate::session::TitleKind;
@@ -39,8 +40,21 @@ pub struct SessionRow {
     pub size: u64,
     pub line_count: i64,
     pub first_prompt: Option<String>,
+    /// resume による分岐 (fork) の判定結果。`rows::build` の時点では判定できないため、
+    /// 全セッションの走査が終わった後に [`apply_fork_marks`] で反映する
+    pub fork: Option<ForkMark>,
     /// fuzzy 検索用に連結した文字列
     haystack: String,
+}
+
+/// [`SessionRow::fork`] の中身。同じ会話から分岐したセッション群のうち、
+/// 自分がどの位置にいるかを表す。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkMark {
+    /// このセッションがグループの起源か
+    pub is_root: bool,
+    /// 自分以外の同グループ session_id
+    pub group_members: Vec<String>,
 }
 
 impl SessionRow {
@@ -219,6 +233,9 @@ pub fn build(
                 size: s.target.size,
                 line_count: s.line_count,
                 first_prompt: s.first_prompt,
+                // fork 検出には全セッションの uuid が出揃っている必要があり、ここでは
+                // まだ判定できない。呼び出し側が apply_fork_marks で後から反映する
+                fork: None,
                 haystack: String::new(),
             };
             row.build_haystack();
@@ -228,6 +245,24 @@ pub fn build(
 
     sort_by_created_desc(&mut rows);
     rows
+}
+
+/// fork グループの判定結果を各行に反映する。
+///
+/// `build` とは別に呼ぶ設計にしてある。fork 検出 (`crate::fork::detect_fork_groups`) は
+/// 全セッションの message uuid が DB に出揃っている必要があり、`build` より後のタイミング
+/// (loader 側で fork 検出を実行した後) にしか判定できないため。
+pub fn apply_fork_marks(rows: &mut [SessionRow], fork_groups: &[ForkGroup]) {
+    let mut marks: HashMap<&str, ForkMark> = HashMap::new();
+    for g in fork_groups {
+        for m in &g.members {
+            let group_members = g.members.iter().filter(|x| *x != m).cloned().collect();
+            marks.insert(m.as_str(), ForkMark { is_root: *m == g.root, group_members });
+        }
+    }
+    for row in rows.iter_mut() {
+        row.fork = marks.get(row.session_id.as_str()).cloned();
+    }
 }
 
 /// 作成日時の降順 (不明は最後)。同着は sessionId で安定させる。
@@ -521,5 +556,55 @@ mod tests {
         assert_eq!(format_size(2048), "2.0K");
         assert_eq!(format_size(5 * 1024 * 1024), "5.0M");
         assert_eq!(format_size(3 * 1024 * 1024 * 1024), "3.0G");
+    }
+
+    #[test]
+    fn buildの直後はforkが未設定() {
+        let (tasks, running, wl, tags) = empty();
+        let rows = build(vec![scanned("s1", "x", Some(t(1)))], &tasks, &running, &wl, &tags);
+        assert!(rows[0].fork.is_none());
+    }
+
+    #[test]
+    fn apply_fork_marksでrootと非rootが反映される() {
+        let (tasks, running, wl, tags) = empty();
+        let mut rows = build(
+            vec![
+                scanned("root1234", "本線", Some(t(100))),
+                scanned("child123", "分岐", Some(t(200))),
+                scanned("other000", "無関係", Some(t(300))),
+            ],
+            &tasks,
+            &running,
+            &wl,
+            &tags,
+        );
+
+        let groups = vec![ForkGroup {
+            root: "root1234".to_string(),
+            members: vec!["root1234".to_string(), "child123".to_string()],
+        }];
+        apply_fork_marks(&mut rows, &groups);
+
+        let root_row = rows.iter().find(|r| r.session_id == "root1234").unwrap();
+        let root_mark = root_row.fork.as_ref().unwrap();
+        assert!(root_mark.is_root);
+        assert_eq!(root_mark.group_members, vec!["child123".to_string()]);
+
+        let child_row = rows.iter().find(|r| r.session_id == "child123").unwrap();
+        let child_mark = child_row.fork.as_ref().unwrap();
+        assert!(!child_mark.is_root);
+        assert_eq!(child_mark.group_members, vec!["root1234".to_string()]);
+
+        let other_row = rows.iter().find(|r| r.session_id == "other000").unwrap();
+        assert!(other_row.fork.is_none(), "グループ外は fork が None のまま");
+    }
+
+    #[test]
+    fn apply_fork_marksは空グループなら何もしない() {
+        let (tasks, running, wl, tags) = empty();
+        let mut rows = build(vec![scanned("s1", "x", Some(t(1)))], &tasks, &running, &wl, &tags);
+        apply_fork_marks(&mut rows, &[]);
+        assert!(rows[0].fork.is_none());
     }
 }

@@ -96,6 +96,8 @@ impl Store {
     }
 
     fn migrate(&self) -> Result<()> {
+        let had_message_uuid_table = self.table_exists("message_uuid")?;
+
         self.conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              CREATE TABLE IF NOT EXISTS session_cache (
@@ -113,10 +115,37 @@ impl Store {
                 session_id TEXT NOT NULL,
                 tag        TEXT NOT NULL,
                 PRIMARY KEY (session_id, tag)
-             );",
+             );
+             CREATE TABLE IF NOT EXISTS message_uuid (
+                session_id TEXT NOT NULL,
+                uuid       TEXT NOT NULL,
+                ts_ms      INTEGER,
+                PRIMARY KEY (session_id, uuid)
+             );
+             CREATE INDEX IF NOT EXISTS idx_message_uuid_uuid ON message_uuid(uuid);",
         )?;
         self.migrate_jsonl_timestamp_column()?;
+
+        // message_uuid テーブルを今回新設した場合 (機能: fork検出)。
+        // 既存の session_cache は uuid 収集より前に書かれたキャッシュなので、mtime/size が
+        // 変わっていない限り再走査されず message_uuid に何も入らない (= fork 検出が永久に
+        // 効かない) ままになってしまう。jsonl_timestamp_ms 追加時と同じ理由で、テーブルを
+        // 新設したこのタイミングで一度だけ session_cache を全件破棄し、次回起動時に
+        // 再走査させる (message_uuid 自体は元々空なので破棄不要)。
+        if !had_message_uuid_table {
+            self.conn.execute("DELETE FROM session_cache", [])?;
+        }
         Ok(())
+    }
+
+    /// 指定した名前のテーブルが存在するか。
+    fn table_exists(&self, name: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?1",
+            [name],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// `jsonl_timestamp_ms` 列の追加 (機能3: 作成日時を jsonl 内 timestamp ベースに変更)。
@@ -294,7 +323,87 @@ impl Store {
             .optional()?;
         Ok(found.is_some())
     }
+
+    // ---- fork 検出 (message uuid) ----
+
+    /// セッションごとの message uuid をまとめて書き直す (fork 検出用)。
+    /// セッション単位で既存行を全部消してから入れ直す (再走査のたびに呼ばれる想定)。
+    pub fn save_message_uuids(&mut self, entries: &[MessageUuidEntry]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut del = tx.prepare("DELETE FROM message_uuid WHERE session_id = ?1")?;
+            let mut ins = tx.prepare(
+                "INSERT OR IGNORE INTO message_uuid (session_id, uuid, ts_ms) VALUES (?1, ?2, ?3)",
+            )?;
+            for (session_id, uuids) in entries {
+                del.execute([session_id.as_str()])?;
+                for (uuid, ts) in uuids {
+                    let ts_ms = ts.and_then(system_time_to_millis);
+                    ins.execute(params![session_id, uuid, ts_ms])?;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 生存している session_id 以外の message uuid を落とす (削除・アーカイブ済みセッション分)。
+    pub fn prune_message_uuids(&mut self, alive_session_ids: &[String]) -> Result<usize> {
+        let alive: std::collections::HashSet<&str> =
+            alive_session_ids.iter().map(String::as_str).collect();
+        let existing: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT DISTINCT session_id FROM message_uuid")?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            rows.collect::<rusqlite::Result<Vec<_>, _>>()?
+        };
+        let dead: Vec<String> = existing
+            .into_iter()
+            .filter(|s| !alive.contains(s.as_str()))
+            .collect();
+
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare("DELETE FROM message_uuid WHERE session_id = ?1")?;
+            for s in &dead {
+                stmt.execute([s])?;
+            }
+        }
+        tx.commit()?;
+        Ok(dead.len())
+    }
+
+    /// 複数セッションにまたがって出現する uuid の行を返す (fork 検出用)。
+    /// session_id ごとのグルーピングや起源判定は呼び出し側 ([`crate::fork`]) が行う。
+    pub fn shared_message_uuids(&self) -> Result<Vec<SharedUuidRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT uuid, session_id, ts_ms FROM message_uuid
+             WHERE uuid IN (
+                 SELECT uuid FROM message_uuid GROUP BY uuid HAVING COUNT(DISTINCT session_id) > 1
+             )
+             ORDER BY uuid",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(SharedUuidRow {
+                uuid: r.get(0)?,
+                session_id: r.get(1)?,
+                ts_ms: r.get(2)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>().map_err(Into::into)
+    }
 }
+
+/// `message_uuid` テーブルの 1 行 (fork 検出の材料)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedUuidRow {
+    pub uuid: String,
+    pub session_id: String,
+    pub ts_ms: Option<i64>,
+}
+
+/// [`Store::save_message_uuids`] に渡す 1 セッション分の入力
+/// (session_id, その session の (uuid, timestamp) 一覧)。
+pub type MessageUuidEntry = (String, Vec<(String, Option<SystemTime>)>);
 
 #[cfg(test)]
 #[allow(non_snake_case)] // テスト名は日本語で書く
@@ -500,5 +609,111 @@ mod tests {
 
         let s2 = Store::open(&path).unwrap();
         assert_eq!(s2.load_cache().unwrap().len(), 1, "既に移行済みのキャッシュは破棄されない");
+    }
+
+    #[test]
+    fn message_uuidテーブル新設時はsession_cacheが破棄される() {
+        // message_uuid テーブルが無い旧 DB (機能: fork検出 導入前) を模す。
+        // これが無いまま session_cache だけキャッシュヒットし続けると、jsonl が
+        // 再走査されず message_uuid に永遠に何も入らない (fork 検出が機能しない)
+        // ため、テーブル新設のタイミングで一度だけ全件破棄する必要がある。
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cst.db");
+        write_legacy_db(&path); // jsonl_timestamp_ms も message_uuid も無い旧DB
+
+        let s = Store::open(&path).unwrap();
+        assert!(s.load_cache().unwrap().is_empty(), "message_uuid 新設時は再走査させるため破棄されるはず");
+
+        // テーブル自体は使えるようになっている
+        let mut s = s;
+        s.save_message_uuids(&[("s1".into(), vec![("u1".to_string(), None)])]).unwrap();
+        assert_eq!(s.shared_message_uuids().unwrap().len(), 0, "共有していないので空でよい");
+    }
+
+    #[test]
+    fn message_uuidテーブルが既にあるdbを開き直してもsession_cacheは保たれる() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("cst.db");
+        let mut s = Store::open(&path).unwrap(); // この時点で message_uuid が新設される
+        s.save_cache(&[("/p/a.jsonl".into(), sample("A"))]).unwrap();
+        drop(s);
+
+        // 2 回目以降は message_uuid が既にあるので session_cache は破棄されない
+        let s2 = Store::open(&path).unwrap();
+        assert_eq!(s2.load_cache().unwrap().len(), 1, "2回目以降は破棄されないはず");
+    }
+
+    #[test]
+    fn message_uuidを保存して共有分だけ読み戻せる() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.save_message_uuids(&[
+            (
+                "sess-a".into(),
+                vec![
+                    ("u1".to_string(), Some(SystemTime::UNIX_EPOCH)),
+                    ("u2".to_string(), None),
+                ],
+            ),
+            (
+                "sess-b".into(),
+                vec![("u1".to_string(), Some(SystemTime::UNIX_EPOCH))],
+            ),
+        ])
+        .unwrap();
+
+        let shared = s.shared_message_uuids().unwrap();
+        // u1 は sess-a と sess-b にまたがるので出る。u2 は sess-a だけなので出ない
+        assert_eq!(shared.len(), 2);
+        assert!(shared.iter().all(|r| r.uuid == "u1"));
+        let sids: std::collections::HashSet<_> = shared.iter().map(|r| r.session_id.as_str()).collect();
+        assert_eq!(sids, ["sess-a", "sess-b"].into_iter().collect());
+    }
+
+    #[test]
+    fn message_uuidは同じsession_idを保存し直すと入れ替わる() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.save_message_uuids(&[("sess-a".into(), vec![("u1".to_string(), None)])]).unwrap();
+        s.save_message_uuids(&[("sess-a".into(), vec![("u2".to_string(), None)])]).unwrap();
+
+        // 直接テーブルを見て u1 が残っていないことを確認する
+        let count: i64 = s
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM message_uuid WHERE session_id = 'sess-a' AND uuid = 'u1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 0, "古いuuidは残っていないはず");
+    }
+
+    #[test]
+    fn message_uuidは消えたsession_id分をprune出来る() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.save_message_uuids(&[
+            ("sess-a".into(), vec![("u1".to_string(), None)]),
+            ("sess-b".into(), vec![("u2".to_string(), None)]),
+        ])
+        .unwrap();
+
+        let pruned = s.prune_message_uuids(&["sess-a".to_string()]).unwrap();
+        assert_eq!(pruned, 1);
+
+        let count: i64 = s
+            .conn
+            .query_row("SELECT COUNT(*) FROM message_uuid", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "sess-a分だけ残るはず");
+    }
+
+    #[test]
+    fn 共有していないuuidだけなら空で返る() {
+        let mut s = Store::open_in_memory().unwrap();
+        s.save_message_uuids(&[
+            ("sess-a".into(), vec![("u1".to_string(), None)]),
+            ("sess-b".into(), vec![("u2".to_string(), None)]),
+        ])
+        .unwrap();
+        assert!(s.shared_message_uuids().unwrap().is_empty());
     }
 }
